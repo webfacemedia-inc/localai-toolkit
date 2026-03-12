@@ -1,0 +1,229 @@
+{
+  "name": "localai-toolkit",
+  "displayName": "LocalAI Toolkit",
+  "description": "Local LM Studio-powered dev tools — commit messages, code explain, refactor, translate, chat playground, and more.",
+  "version": "0.1.0",
+  "publisher": "webfacemedia",
+  "author": "Tommy @ Webface Media",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "localai.generateCommitMessage",
+        "title": "Generate Commit Message with LM",
+        "shortTitle": "LM Commit",
+        "icon": "$(sparkle)",
+        "category": "LocalAI"
+      },
+      {
+        "command": "localai.explainSelection",
+        "title": "LocalAI: Explain Selection"
+      },
+      {
+        "command": "localai.refactorSelection",
+        "title": "LocalAI: Refactor Selection"
+      },
+      {
+        "command": "localai.addComments",
+        "title": "LocalAI: Add Comments to Selection"
+      },
+      {
+        "command": "localai.writeTests",
+        "title": "LocalAI: Write Tests for Selection"
+      },
+      {
+        "command": "localai.translateText",
+        "title": "LocalAI: Translate Selection"
+      },
+      {
+        "command": "localai.customPrompt",
+        "title": "LocalAI: Custom Prompt on Selection"
+      },
+      {
+        "command": "localai.openPlayground",
+        "title": "LocalAI: Open Chat Playground",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "localai.listModels",
+        "title": "LocalAI: List Available Models"
+      },
+      {
+        "command": "localai.switchModel",
+        "title": "LocalAI: Switch Model"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "localai.generateCommitMessage",
+        "key": "ctrl+shift+g",
+        "mac": "cmd+shift+g"
+      },
+      {
+        "command": "localai.explainSelection",
+        "key": "ctrl+shift+e",
+        "mac": "cmd+shift+e",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "localai.openPlayground",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l"
+      },
+      {
+        "command": "localai.customPrompt",
+        "key": "ctrl+shift+p",
+        "mac": "cmd+shift+p",
+        "when": "editorHasSelection"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "submenu": "localai.submenu",
+          "group": "localai@1",
+          "when": "editorHasSelection"
+        }
+      ],
+      "localai.submenu": [
+        {
+          "command": "localai.explainSelection",
+          "group": "1_understand@1"
+        },
+        {
+          "command": "localai.addComments",
+          "group": "1_understand@2"
+        },
+        {
+          "command": "localai.refactorSelection",
+          "group": "2_modify@1"
+        },
+        {
+          "command": "localai.writeTests",
+          "group": "2_modify@2"
+        },
+        {
+          "command": "localai.translateText",
+          "group": "3_other@1"
+        },
+        {
+          "command": "localai.customPrompt",
+          "group": "3_other@2"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "localai.generateCommitMessage",
+          "group": "navigation",
+          "when": "scmProvider == git"
+        }
+      ],
+      "scm/inputBox": [
+        {
+          "command": "localai.generateCommitMessage",
+          "group": "navigation",
+          "when": "scmProvider == git"
+        }
+      ],
+      "scm/change/title": [
+        {
+          "command": "localai.generateCommitMessage",
+          "group": "inline",
+          "when": "scmProvider == git"
+        }
+      ],
+      "scm/resourceGroup/context": [
+        {
+          "command": "localai.generateCommitMessage",
+          "group": "inline",
+          "when": "scmProvider == git && scmResourceGroup == workingTree"
+        },
+        {
+          "command": "localai.generateCommitMessage",
+          "group": "inline",
+          "when": "scmProvider == git && scmResourceGroup == index"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "localai.submenu",
+        "label": "LocalAI Toolkit"
+      }
+    ],
+    "configuration": {
+      "title": "LocalAI Toolkit",
+      "properties": {
+        "localai.endpoint": {
+          "type": "string",
+          "default": "http://localhost:1234",
+          "description": "Base URL of your LM Studio (or any OpenAI-compatible) server"
+        },
+        "localai.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model identifier to use. Leave blank to use whatever is loaded in LM Studio."
+        },
+        "localai.temperature": {
+          "type": "number",
+          "default": 0.3,
+          "description": "Temperature for completions (0-2). Lower = more deterministic."
+        },
+        "localai.maxTokens": {
+          "type": "number",
+          "default": 2048,
+          "description": "Max tokens for responses"
+        },
+        "localai.commitStyle": {
+          "type": "string",
+          "default": "conventional",
+          "enum": [
+            "conventional",
+            "descriptive",
+            "brief"
+          ],
+          "enumDescriptions": [
+            "feat(scope): description — Conventional Commits format",
+            "Detailed multi-line description of all changes",
+            "One-line summary, no prefix"
+          ],
+          "description": "Commit message style"
+        },
+        "localai.languages": {
+          "type": "array",
+          "default": [
+            "English",
+            "French",
+            "Spanish"
+          ],
+          "description": "Languages available for translation"
+        },
+        "localai.streamResponses": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stream responses token-by-token (playground & explain)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --no-dependencies",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
