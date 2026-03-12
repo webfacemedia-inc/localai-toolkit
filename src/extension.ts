@@ -11,6 +11,7 @@ import {
   customPrompt,
 } from "./prompts";
 import { openPlayground } from "./playground";
+import { SidebarViewProvider } from "./sidebar";
 
 // ────────────────────────────────────────────────────────────────
 // Activation
@@ -18,6 +19,20 @@ import { openPlayground } from "./playground";
 
 export function activate(context: vscode.ExtensionContext) {
   console.log("LocalAI Toolkit activated");
+
+  // Sidebar view
+  const sidebarProvider = new SidebarViewProvider(context);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      SidebarViewProvider.viewType,
+      sidebarProvider
+    )
+  );
+
+  // Refresh sidebar when config changes
+  vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration("localai")) sidebarProvider.refresh();
+  });
 
   // Status bar item showing connection state
   const statusItem = vscode.window.createStatusBarItem(

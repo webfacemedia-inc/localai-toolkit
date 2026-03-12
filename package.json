@@ -16,6 +16,24 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localai-sidebar",
+          "title": "LocalAI Toolkit",
+          "icon": "$(hubot)"
+        }
+      ]
+    },
+    "views": {
+      "localai-sidebar": [
+        {
+          "type": "webview",
+          "id": "localai.sidebarView",
+          "name": "LocalAI Toolkit"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "localai.generateCommitMessage",
