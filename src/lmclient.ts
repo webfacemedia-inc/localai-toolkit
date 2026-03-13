@@ -75,6 +75,7 @@ function streamRequest(
     const lib = url.startsWith("https") ? https : http;
     let full = "";
     let buffer = "";
+    let inThinking = false;
     const req = lib.request(url, options, (res) => {
       res.on("data", (chunk: Buffer) => {
         buffer += chunk.toString();
@@ -87,8 +88,31 @@ function streamRequest(
           if (payload === "[DONE]") continue;
           try {
             const parsed = JSON.parse(payload);
-            const token = parsed.choices?.[0]?.delta?.content;
+            const delta = parsed.choices?.[0]?.delta;
+            if (!delta) continue;
+
+            // Qwen3/reasoning models may send thinking tokens via
+            // reasoning_content instead of content.  Capture both.
+            const reasoning = delta.reasoning_content;
+            if (reasoning) {
+              if (!inThinking) {
+                inThinking = true;
+                const tag = "<think>";
+                full += tag;
+                onToken(tag);
+              }
+              full += reasoning;
+              onToken(reasoning);
+            }
+
+            const token = delta.content;
             if (token) {
+              if (inThinking) {
+                inThinking = false;
+                const tag = "</think>\n\n";
+                full += tag;
+                onToken(tag);
+              }
               full += token;
               onToken(token);
             }
@@ -97,7 +121,13 @@ function streamRequest(
           }
         }
       });
-      res.on("end", () => resolve(full));
+      res.on("end", () => {
+        // Close any unclosed think tag
+        if (inThinking) {
+          full += "</think>\n\n";
+        }
+        resolve(full);
+      });
     });
     req.on("error", reject);
     req.setTimeout(120_000, () => req.destroy(new Error("Stream timed out")));

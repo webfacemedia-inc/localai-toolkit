@@ -10,6 +10,11 @@ let activeCancellation: vscode.CancellationTokenSource | undefined;
 let abortLoop = false;
 let sessionAutoApprove = false;
 
+/** Strip <think>...</think> blocks from text to save context window */
+function stripThinkBlocks(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+}
+
 export function openPlayground(context: vscode.ExtensionContext) {
   if (panel) {
     panel.reveal();
@@ -140,12 +145,19 @@ async function handleChat(userText: string, systemPrompt?: string) {
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     if (abortLoop) break;
 
-    // Build messages for this iteration
+    // Build messages for this iteration — strip <think> blocks from prior
+    // assistant messages to save context window for reasoning models.
     const messages: ChatMessage[] = [];
     if (systemContent) {
       messages.push({ role: "system", content: systemContent });
     }
-    messages.push(...conversationHistory);
+    for (const msg of conversationHistory) {
+      if (msg.role === "assistant") {
+        messages.push({ role: "assistant", content: stripThinkBlocks(msg.content) });
+      } else {
+        messages.push(msg);
+      }
+    }
 
     // Signal streaming start
     panel?.webview.postMessage({
@@ -189,6 +201,24 @@ async function handleChat(userText: string, systemPrompt?: string) {
 
     // If harness is disabled or no tool calls, we're done
     if (!harnessEnabled) {
+      panel?.webview.postMessage({ type: "streamEnd" });
+      return;
+    }
+
+    // Guard against empty/whitespace-only responses — the model may have
+    // stalled after receiving tool results.  Nudge it once before giving up.
+    if (!fullResponse.trim()) {
+      if (iteration > 0) {
+        // This is a follow-up iteration where the model returned nothing.
+        // Nudge it by appending a hint and retry ONE more time.
+        conversationHistory.pop(); // remove the empty assistant message
+        conversationHistory.push({
+          role: "user",
+          content: "[System: Your previous response was empty. Please continue — analyze the tool results above and provide your answer or next steps.]",
+        });
+        panel?.webview.postMessage({ type: "streamEnd" });
+        continue; // retry this iteration
+      }
       panel?.webview.postMessage({ type: "streamEnd" });
       return;
     }
@@ -245,6 +275,7 @@ async function handleChat(userText: string, systemPrompt?: string) {
         : call.type === "edit_file" ? `edit_file(${call.path})`
         : call.type === "replace_lines" ? `replace_lines(${call.path}:${call.startLine}-${call.endLine})`
         : call.type === "fetch_url" ? `fetch_url(${call.url})`
+        : call.type === "invalid" ? `invalid(${call.name})`
         : `run_command(${call.command})`;
 
       toolResults.push(`[Tool Result: ${label}]\n${result.success ? "Success" : "Failed"}: ${result.output}`);
@@ -255,10 +286,11 @@ async function handleChat(userText: string, systemPrompt?: string) {
     // Feed tool results back as a user message for the next iteration
     const remaining = maxIterations - iteration - 1;
     let resultsContent = toolResults.join("\n\n");
+    resultsContent += "\n\nBased on the tool results above, continue your work. ";
     if (remaining <= 3) {
-      resultsContent += `\n\n[System: ${remaining} iteration(s) remaining. Wrap up your work — provide your final answer without further tool calls if possible.]`;
+      resultsContent += `[System: ${remaining} iteration(s) remaining. Wrap up your work — provide your final answer without further tool calls if possible.]`;
     } else {
-      resultsContent += `\n\n[System: ${remaining} iteration(s) remaining.]`;
+      resultsContent += `[System: ${remaining} iteration(s) remaining. Analyze the results and proceed — explain what you found, make additional tool calls if needed, or provide your final answer.]`;
     }
     conversationHistory.push({
       role: "user",
@@ -362,7 +394,7 @@ function getPlaygroundHTML(): string {
   .tool-card-output { margin-top: 6px; padding: 6px; background: rgba(0,0,0,0.2); border-radius: 4px; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; max-height: 150px; overflow-y: auto; white-space: pre-wrap; }
 
   /* Streaming cursor */
-  .streaming::after { content: "\\25ca"; animation: blink 0.8s infinite; color: var(--accent); }
+  .streaming::after { content: "\\2588"; animation: blink 0.8s infinite; color: var(--accent); font-size: 11px; }
   @keyframes blink { 50% { opacity: 0; } }
 
   /* Iteration badge */
@@ -568,6 +600,10 @@ function getPlaygroundHTML(): string {
         icon = "✏️"; detail = tool.tool.path + ":" + tool.tool.startLine + "-" + tool.tool.endLine; break;
       case "run_command":
         icon = "⚡"; detail = tool.tool.command; break;
+      case "fetch_url":
+        icon = "🌐"; detail = tool.tool.url; break;
+      case "invalid":
+        icon = "❌"; detail = tool.tool.name + ": " + (tool.tool.error || "unknown tool"); break;
       default:
         icon = "🔧"; detail = "";
     }

@@ -186,6 +186,8 @@ export async function executeTool(
       return executeRunCommand(call.command, confirm);
     case "fetch_url":
       return executeFetchUrl(call.url, confirm);
+    case "invalid":
+      return { success: false, output: call.error };
   }
 }
 
@@ -233,9 +235,24 @@ async function executeWriteFile(
     return { success: false, output: `Invalid path: ${filePath}. Must be relative to workspace, no ".." allowed.` };
   }
 
+  // Block write_file on existing files — force models to use replace_lines or edit_file
+  try {
+    const uri = vscode.Uri.file(resolved);
+    await vscode.workspace.fs.stat(uri);
+    // File exists — reject
+    return {
+      success: false,
+      output: `REJECTED: "${filePath}" already exists. write_file is ONLY for creating NEW files. `
+        + `To modify an existing file, use replace_lines (preferred — specify line numbers from read_file output) `
+        + `or edit_file (search/replace). Read the file first if you haven't already.`,
+    };
+  } catch {
+    // File doesn't exist — good, proceed with creation
+  }
+
   const approved = await confirm(
-    `Write file: ${filePath}`,
-    `The AI wants to create/overwrite this file (${content.length} chars). Allow?`
+    `Create file: ${filePath}`,
+    `The AI wants to create this NEW file (${content.length} chars). Allow?`
   );
   if (!approved) {
     return { success: false, output: "User rejected write_file operation." };
@@ -256,14 +273,14 @@ async function executeWriteFile(
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside, true);
 
-    let msg = `File written: ${filePath} (${content.length} chars)`;
+    let msg = `File created: ${filePath} (${content.length} chars)`;
     const syntaxErr = validateSyntax(content, filePath);
     if (syntaxErr) {
       msg += `\n\n${syntaxErr}`;
     }
     return { success: true, output: msg };
   } catch (err: any) {
-    return { success: false, output: `Failed to write ${filePath}: ${err.message}` };
+    return { success: false, output: `Failed to create ${filePath}: ${err.message}` };
   }
 }
 

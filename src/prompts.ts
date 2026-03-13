@@ -158,6 +158,7 @@ Rules:
 - NEVER run long-running or blocking commands (e.g. "npm run dev", "npm start", "python -m http.server", "docker compose up"). These will timeout and waste an iteration. Instead, use one-shot commands like "npm run build", "npm test", or "npx tsc --noEmit". If the user asks you to start a server, tell them to run it manually in a terminal.
 - Be efficient with iterations. Use multiple tool calls in one response when possible. Don't re-read files you've already read. When iterations are running low, provide your final answer instead of making more tool calls.
 - If a command fails, diagnose the issue and fix it — don't blindly retry the same command.
+- IMPORTANT: When you receive tool results, you MUST respond with your analysis, next steps, or final answer. Never return an empty response after tool results. Always continue the conversation.
 
 ${fileList}`;
 }

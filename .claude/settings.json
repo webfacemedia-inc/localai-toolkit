@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(code --install-extension localai-toolkit-0.5.4.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.5.5.vsix --force)"
+    ]
+  }
+}

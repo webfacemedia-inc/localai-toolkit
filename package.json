@@ -2,7 +2,7 @@
   "name": "localai-toolkit",
   "displayName": "LocalAI Toolkit",
   "description": "Local LM Studio-powered dev tools — commit messages, code explain, refactor, translate, agentic harness with tool use, and more.",
-  "version": "0.4.1",
+  "version": "0.5.5",
   "publisher": "webfacemedia",
   "author": "Tommy @ Webface Media",
   "license": "MIT",
