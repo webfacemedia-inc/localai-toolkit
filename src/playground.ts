@@ -8,6 +8,7 @@ let panel: vscode.WebviewPanel | undefined;
 let conversationHistory: ChatMessage[] = [];
 let activeCancellation: vscode.CancellationTokenSource | undefined;
 let abortLoop = false;
+let sessionAutoApprove = false;
 
 export function openPlayground(context: vscode.ExtensionContext) {
   if (panel) {
@@ -21,6 +22,10 @@ export function openPlayground(context: vscode.ExtensionContext) {
     vscode.ViewColumn.Beside,
     { enableScripts: true, retainContextWhenHidden: true }
   );
+
+  sessionAutoApprove = vscode.workspace
+    .getConfiguration("localai.harness")
+    .get<boolean>("autoApproveAll", false);
 
   panel.webview.html = getPlaygroundHTML();
   sendStatus();
@@ -41,6 +46,10 @@ export function openPlayground(context: vscode.ExtensionContext) {
         case "cancelStream":
           abortLoop = true;
           activeCancellation?.cancel();
+          break;
+        case "toggleAutoApprove":
+          sessionAutoApprove = msg.enabled;
+          vscode.workspace.getConfiguration("localai.harness").update("autoApproveAll", msg.enabled, vscode.ConfigurationTarget.Workspace);
           break;
         case "insertCode": {
           const editor = vscode.window.activeTextEditor;
@@ -93,6 +102,7 @@ async function sendStatus() {
     model: cfg.get<string>("model", "") || models[0] || "default",
     models,
     harnessEnabled,
+    autoApproveAll: sessionAutoApprove,
     version,
   });
 }
@@ -107,6 +117,7 @@ async function handleChat(userText: string, systemPrompt?: string) {
   const maxIterations = cfg.get<number>("maxIterations", 10);
   const harnessMaxTokens = cfg.get<number>("maxTokens", 4096);
   const autoApproveReads = cfg.get<boolean>("autoApproveReads", true);
+  const autoApproveAll = sessionAutoApprove || cfg.get<boolean>("autoApproveAll", false);
 
   abortLoop = false;
   conversationHistory.push({ role: "user", content: userText });
@@ -202,7 +213,7 @@ async function handleChat(userText: string, systemPrompt?: string) {
 
       let result: ToolResult;
 
-      if (call.type === "read_file" && autoApproveReads) {
+      if (autoApproveAll || (call.type === "read_file" && autoApproveReads)) {
         result = await executeTool(call, async () => true);
       } else {
         result = await executeTool(call, async (message, detail) => {
@@ -210,8 +221,14 @@ async function handleChat(userText: string, systemPrompt?: string) {
             `${message}`,
             { detail, modal: true },
             "Allow",
+            "Allow All",
             "Deny"
           );
+          if (choice === "Allow All") {
+            sessionAutoApprove = true;
+            panel?.webview.postMessage({ type: "autoApproveChanged", enabled: true });
+            return true;
+          }
           return choice === "Allow";
         });
       }
@@ -226,6 +243,7 @@ async function handleChat(userText: string, systemPrompt?: string) {
       const label = call.type === "read_file" ? `read_file(${call.path})`
         : call.type === "write_file" ? `write_file(${call.path})`
         : call.type === "edit_file" ? `edit_file(${call.path})`
+        : call.type === "replace_lines" ? `replace_lines(${call.path}:${call.startLine}-${call.endLine})`
         : call.type === "fetch_url" ? `fetch_url(${call.url})`
         : `run_command(${call.command})`;
 
@@ -235,9 +253,16 @@ async function handleChat(userText: string, systemPrompt?: string) {
     if (abortLoop) break;
 
     // Feed tool results back as a user message for the next iteration
+    const remaining = maxIterations - iteration - 1;
+    let resultsContent = toolResults.join("\n\n");
+    if (remaining <= 3) {
+      resultsContent += `\n\n[System: ${remaining} iteration(s) remaining. Wrap up your work — provide your final answer without further tool calls if possible.]`;
+    } else {
+      resultsContent += `\n\n[System: ${remaining} iteration(s) remaining.]`;
+    }
     conversationHistory.push({
       role: "user",
-      content: toolResults.join("\n\n"),
+      content: resultsContent,
     });
   }
 
@@ -359,6 +384,10 @@ function getPlaygroundHTML(): string {
     <span class="endpoint" id="endpoint-label"></span>
     <span class="harness-badge" id="harness-badge" style="display:none">HARNESS</span>
     <span class="version" id="version-label">v—</span>
+    <label id="auto-approve-toggle" title="Auto-approve all tool calls (no confirmation popups)" style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;margin-left:4px;">
+      <input type="checkbox" id="auto-approve-cb" style="cursor:pointer;">
+      <span>Auto-approve</span>
+    </label>
     <button id="refresh-btn" title="Refresh connection">↻</button>
   </div>
   <div id="system-bar">
@@ -417,6 +446,10 @@ function getPlaygroundHTML(): string {
     chat.innerHTML = "";
   });
   refreshBtn.addEventListener("click", () => vscode.postMessage({ type: "refresh" }));
+  const autoApproveCb = document.getElementById("auto-approve-cb");
+  autoApproveCb.addEventListener("change", () => {
+    vscode.postMessage({ type: "toggleAutoApprove", enabled: autoApproveCb.checked });
+  });
 
   function setStreaming(active) {
     streaming = active;
@@ -531,6 +564,8 @@ function getPlaygroundHTML(): string {
         icon = "📝"; detail = tool.tool.path; break;
       case "edit_file":
         icon = "✏️"; detail = tool.tool.path; break;
+      case "replace_lines":
+        icon = "✏️"; detail = tool.tool.path + ":" + tool.tool.startLine + "-" + tool.tool.endLine; break;
       case "run_command":
         icon = "⚡"; detail = tool.tool.command; break;
       default:
@@ -580,6 +615,10 @@ function getPlaygroundHTML(): string {
         endpointLabel.textContent = msg.endpoint;
         harnessBadge.style.display = msg.harnessEnabled ? "" : "none";
         versionLabel.textContent = "v" + (msg.version || "?");
+        if (msg.autoApproveAll !== undefined) autoApproveCb.checked = msg.autoApproveAll;
+        break;
+      case "autoApproveChanged":
+        autoApproveCb.checked = msg.enabled;
         break;
       case "streamStart":
         setStreaming(true);

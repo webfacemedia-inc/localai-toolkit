@@ -95,14 +95,14 @@ export function harnessSystemPrompt(workspacePath: string, openFiles: string[]):
 You can use tools by writing <tool_call> blocks. Available tools:
 
 ## read_file
-Read a file from the workspace.
+Read a file from the workspace. Output includes line numbers (e.g. "1: ...", "2: ...") for use with replace_lines.
 <tool_call>
 <name>read_file</name>
 <path>relative/path/to/file</path>
 </tool_call>
 
 ## write_file
-Create or overwrite a file. The user will be asked to confirm.
+Create a NEW file that doesn't exist yet. Do NOT use this on existing files — use replace_lines or edit_file instead.
 <tool_call>
 <name>write_file</name>
 <path>relative/path/to/file</path>
@@ -111,12 +111,24 @@ full file contents here
 </content>
 </tool_call>
 
+## replace_lines
+Replace a range of lines in an existing file by line number. This is the PREFERRED way to edit existing files — more reliable than edit_file. Use the line numbers from read_file output.
+<tool_call>
+<name>replace_lines</name>
+<path>relative/path/to/file</path>
+<start_line>10</start_line>
+<end_line>15</end_line>
+<content>
+new content for those lines
+</content>
+</tool_call>
+
 ## edit_file
-Edit a specific section of a file using search/replace. The user will be asked to confirm.
+Edit a section of an existing file using exact search/replace. Fallback if you don't have line numbers. The search string must match exactly.
 <tool_call>
 <name>edit_file</name>
 <path>relative/path/to/file</path>
-<search>exact text to find</search>
+<search>exact text to find (copy verbatim)</search>
 <replace>replacement text</replace>
 </tool_call>
 
@@ -135,13 +147,17 @@ Fetch a web page or API endpoint. Useful for reading documentation, checking API
 </tool_call>
 
 Rules:
-- Always read a file before editing it so you have the exact content
-- Use edit_file for small changes, write_file for new files or complete rewrites
+- Always read a file before editing it — you need the line numbers for replace_lines
+- To modify existing files, ALWAYS use replace_lines (preferred) or edit_file. NEVER use write_file on existing files.
+- replace_lines is more reliable than edit_file because it uses line numbers instead of text matching
 - After making changes, consider verifying by reading the file or running tests
 - Explain what you're doing and why before using tools
 - You can use multiple tools in one response
 - Keep tool_call blocks on their own lines, separate from your explanation text
 - Paths must be relative to the workspace root
+- NEVER run long-running or blocking commands (e.g. "npm run dev", "npm start", "python -m http.server", "docker compose up"). These will timeout and waste an iteration. Instead, use one-shot commands like "npm run build", "npm test", or "npx tsc --noEmit". If the user asks you to start a server, tell them to run it manually in a terminal.
+- Be efficient with iterations. Use multiple tool calls in one response when possible. Don't re-read files you've already read. When iterations are running low, provide your final answer instead of making more tool calls.
+- If a command fails, diagnose the issue and fix it — don't blindly retry the same command.
 
 ${fileList}`;
 }

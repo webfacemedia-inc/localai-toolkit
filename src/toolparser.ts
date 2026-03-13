@@ -26,12 +26,20 @@ export interface RunCommandCall {
   command: string;
 }
 
+export interface ReplaceLinesCall {
+  type: "replace_lines";
+  path: string;
+  startLine: number;
+  endLine: number;
+  content: string;
+}
+
 export interface FetchUrlCall {
   type: "fetch_url";
   url: string;
 }
 
-export type ToolCall = ReadFileCall | WriteFileCall | EditFileCall | RunCommandCall | FetchUrlCall;
+export type ToolCall = ReadFileCall | WriteFileCall | EditFileCall | ReplaceLinesCall | RunCommandCall | FetchUrlCall;
 
 const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)<\/tool_call>/g;
 
@@ -78,6 +86,26 @@ export function parseToolCalls(text: string): ToolCall[] {
             search: search.replace(/^\n/, "").replace(/\n$/, ""),
             replace: replace.replace(/^\n/, "").replace(/\n$/, ""),
           });
+        }
+        break;
+      }
+      case "replace_lines": {
+        const path = extractTag(body, "path")?.trim();
+        const startStr = extractTag(body, "start_line")?.trim();
+        const endStr = extractTag(body, "end_line")?.trim();
+        const content = extractTag(body, "content");
+        if (path && startStr && endStr && content !== undefined) {
+          const startLine = parseInt(startStr, 10);
+          const endLine = parseInt(endStr, 10);
+          if (!isNaN(startLine) && !isNaN(endLine)) {
+            calls.push({
+              type: "replace_lines",
+              path,
+              startLine,
+              endLine,
+              content: content.replace(/^\n/, "").replace(/\n$/, ""),
+            });
+          }
         }
         break;
       }
