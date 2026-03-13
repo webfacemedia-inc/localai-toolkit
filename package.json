@@ -1,8 +1,8 @@
 {
   "name": "localai-toolkit",
   "displayName": "LocalAI Toolkit",
-  "description": "Local LM Studio-powered dev tools — commit messages, code explain, refactor, translate, chat playground, and more.",
-  "version": "0.1.0",
+  "description": "Local LM Studio-powered dev tools — commit messages, code explain, refactor, translate, agentic harness with tool use, and more.",
+  "version": "0.2.2",
   "publisher": "webfacemedia",
   "author": "Tommy @ Webface Media",
   "license": "MIT",
@@ -225,10 +225,36 @@
           ],
           "description": "Languages available for translation"
         },
-        "localai.streamResponses": {
+        "localai.harness.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Stream responses token-by-token (playground & explain)"
+          "description": "Enable harness mode (tool use) in the playground"
+        },
+        "localai.harness.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "description": "Max tokens for harness responses (higher than normal for agentic use)"
+        },
+        "localai.harness.maxIterations": {
+          "type": "number",
+          "default": 10,
+          "description": "Maximum tool-use iterations per message"
+        },
+        "localai.harness.commandTimeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "Timeout in ms for shell commands executed by the harness"
+        },
+        "localai.harness.autoApproveReads": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-approve read_file tool calls without confirmation"
+        },
+        "localai.harness.blockedCommands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["rm -rf /", "sudo rm", "mkfs", "format", ":(){:|:&};:"],
+          "description": "Shell command patterns that are blocked from execution"
         }
       }
     }
@@ -236,7 +262,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npx @vscode/vsce package --no-dependencies",
+    "package": "npm run compile && npx @vscode/vsce package --no-dependencies",
     "lint": "tsc --noEmit"
   },
   "devDependencies": {

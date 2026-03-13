@@ -1,8 +1,13 @@
 import * as vscode from "vscode";
 import { listModels, completeStream, ChatMessage, healthCheck } from "./lmclient";
+import { parseToolCalls } from "./toolparser";
+import { executeTool, ToolResult } from "./toolexecutor";
+import { harnessSystemPrompt } from "./prompts";
 
 let panel: vscode.WebviewPanel | undefined;
 let conversationHistory: ChatMessage[] = [];
+let activeCancellation: vscode.CancellationTokenSource | undefined;
+let abortLoop = false;
 
 export function openPlayground(context: vscode.ExtensionContext) {
   if (panel) {
@@ -18,8 +23,6 @@ export function openPlayground(context: vscode.ExtensionContext) {
   );
 
   panel.webview.html = getPlaygroundHTML();
-
-  // Send initial status
   sendStatus();
 
   panel.webview.onDidReceiveMessage(
@@ -35,9 +38,17 @@ export function openPlayground(context: vscode.ExtensionContext) {
         case "refresh":
           await sendStatus();
           break;
-        case "setSystem":
-          // System prompt stored in conversation on next send
+        case "cancelStream":
+          abortLoop = true;
+          activeCancellation?.cancel();
           break;
+        case "insertCode": {
+          const editor = vscode.window.activeTextEditor;
+          if (editor) {
+            editor.edit((eb) => eb.insert(editor.selection.active, msg.code));
+          }
+          break;
+        }
       }
     },
     undefined,
@@ -46,8 +57,15 @@ export function openPlayground(context: vscode.ExtensionContext) {
 
   panel.onDidDispose(() => {
     panel = undefined;
+    conversationHistory = [];
+    abortLoop = true;
+    activeCancellation?.cancel();
   });
 }
+
+// ────────────────────────────────────────────────────────────────
+// Status
+// ────────────────────────────────────────────────────────────────
 
 async function sendStatus() {
   const cfg = vscode.workspace.getConfiguration("localai");
@@ -60,46 +78,175 @@ async function sendStatus() {
       models = list.map((m) => m.id);
     } catch { /* ignore */ }
   }
+
+  const harnessEnabled = vscode.workspace
+    .getConfiguration("localai.harness")
+    .get<boolean>("enabled", true);
+
+  const ext = vscode.extensions.getExtension("webfacemedia.localai-toolkit");
+  const version = ext?.packageJSON?.version ?? "dev";
+
   panel?.webview.postMessage({
     type: "status",
     alive,
     endpoint,
     model: cfg.get<string>("model", "") || models[0] || "default",
     models,
+    harnessEnabled,
+    version,
   });
 }
 
+// ────────────────────────────────────────────────────────────────
+// Chat handler — agentic loop with tool use
+// ────────────────────────────────────────────────────────────────
+
 async function handleChat(userText: string, systemPrompt?: string) {
-  // Build messages
-  const messages: ChatMessage[] = [];
-  if (systemPrompt?.trim()) {
-    messages.push({ role: "system", content: systemPrompt.trim() });
-  }
+  const cfg = vscode.workspace.getConfiguration("localai.harness");
+  const harnessEnabled = cfg.get<boolean>("enabled", true);
+  const maxIterations = cfg.get<number>("maxIterations", 10);
+  const harnessMaxTokens = cfg.get<number>("maxTokens", 4096);
+  const autoApproveReads = cfg.get<boolean>("autoApproveReads", true);
+
+  abortLoop = false;
   conversationHistory.push({ role: "user", content: userText });
-  messages.push(...conversationHistory);
 
-  // Signal streaming start
-  panel?.webview.postMessage({ type: "streamStart" });
+  // Build the system prompt
+  let systemContent = "";
+  if (harnessEnabled) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "unknown";
+    const openFiles = vscode.window.visibleTextEditors
+      .map((e) => vscode.workspace.asRelativePath(e.document.uri))
+      .filter((p) => !p.startsWith("extension-output"));
+    systemContent = harnessSystemPrompt(root, openFiles);
+    if (systemPrompt?.trim()) {
+      systemContent += `\n\nAdditional instructions from user:\n${systemPrompt.trim()}`;
+    }
+  } else if (systemPrompt?.trim()) {
+    systemContent = systemPrompt.trim();
+  }
 
-  const source = new vscode.CancellationTokenSource();
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    if (abortLoop) break;
 
-  try {
-    const full = await completeStream(
-      { messages },
-      (token) => {
-        panel?.webview.postMessage({ type: "streamToken", token });
-      },
-      source.token
-    );
-    conversationHistory.push({ role: "assistant", content: full });
-    panel?.webview.postMessage({ type: "streamEnd" });
-  } catch (err: any) {
+    // Build messages for this iteration
+    const messages: ChatMessage[] = [];
+    if (systemContent) {
+      messages.push({ role: "system", content: systemContent });
+    }
+    messages.push(...conversationHistory);
+
+    // Signal streaming start
     panel?.webview.postMessage({
-      type: "streamError",
-      error: err.message ?? "Unknown error",
+      type: "streamStart",
+      iteration: iteration + 1,
+      maxIterations,
     });
-  } finally {
-    source.dispose();
+
+    activeCancellation = new vscode.CancellationTokenSource();
+
+    let fullResponse = "";
+    try {
+      fullResponse = await completeStream(
+        {
+          messages,
+          maxTokens: harnessEnabled ? harnessMaxTokens : undefined,
+        },
+        (token) => {
+          panel?.webview.postMessage({ type: "streamToken", token });
+        },
+        activeCancellation.token
+      );
+    } catch (err: any) {
+      if (err.message === "Cancelled") {
+        panel?.webview.postMessage({ type: "streamEnd", cancelled: true });
+      } else {
+        panel?.webview.postMessage({
+          type: "streamError",
+          error: err.message ?? "Unknown error",
+        });
+      }
+      activeCancellation.dispose();
+      activeCancellation = undefined;
+      return;
+    } finally {
+      activeCancellation?.dispose();
+      activeCancellation = undefined;
+    }
+
+    conversationHistory.push({ role: "assistant", content: fullResponse });
+
+    // If harness is disabled or no tool calls, we're done
+    if (!harnessEnabled) {
+      panel?.webview.postMessage({ type: "streamEnd" });
+      return;
+    }
+
+    const toolCalls = parseToolCalls(fullResponse);
+    if (toolCalls.length === 0) {
+      panel?.webview.postMessage({ type: "streamEnd" });
+      return;
+    }
+
+    // Execute tool calls
+    panel?.webview.postMessage({ type: "streamEnd" });
+
+    const toolResults: string[] = [];
+
+    for (const call of toolCalls) {
+      if (abortLoop) break;
+
+      // Notify webview about tool execution
+      const callId = `${call.type}_${Date.now()}`;
+      panel?.webview.postMessage({ type: "toolCallDetected", id: callId, tool: call });
+
+      let result: ToolResult;
+
+      if (call.type === "read_file" && autoApproveReads) {
+        result = await executeTool(call, async () => true);
+      } else {
+        result = await executeTool(call, async (message, detail) => {
+          const choice = await vscode.window.showInformationMessage(
+            `${message}`,
+            { detail, modal: true },
+            "Allow",
+            "Deny"
+          );
+          return choice === "Allow";
+        });
+      }
+
+      panel?.webview.postMessage({
+        type: "toolCallResult",
+        id: callId,
+        success: result.success,
+        output: result.output.slice(0, 2000), // Truncate for webview display
+      });
+
+      const label = call.type === "read_file" ? `read_file(${call.path})`
+        : call.type === "write_file" ? `write_file(${call.path})`
+        : call.type === "edit_file" ? `edit_file(${call.path})`
+        : call.type === "fetch_url" ? `fetch_url(${call.url})`
+        : `run_command(${call.command})`;
+
+      toolResults.push(`[Tool Result: ${label}]\n${result.success ? "Success" : "Failed"}: ${result.output}`);
+    }
+
+    if (abortLoop) break;
+
+    // Feed tool results back as a user message for the next iteration
+    conversationHistory.push({
+      role: "user",
+      content: toolResults.join("\n\n"),
+    });
+  }
+
+  // If we hit max iterations
+  if (!abortLoop) {
+    panel?.webview.postMessage({
+      type: "streamEnd",
+      maxReached: true,
+    });
   }
 }
 
@@ -124,6 +271,9 @@ function getPlaygroundHTML(): string {
     --accent: var(--vscode-textLink-foreground, #4fc1ff);
     --user-bg: var(--vscode-textBlockQuote-background, #1e1e2e);
     --ai-bg: transparent;
+    --danger: #f44747;
+    --success: #4ec9b0;
+    --warning: #cca700;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: var(--vscode-font-family); color: var(--fg); background: var(--bg); height: 100vh; display: flex; flex-direction: column; }
@@ -131,10 +281,12 @@ function getPlaygroundHTML(): string {
   /* Status bar */
   #status-bar { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; flex-shrink: 0; }
   #status-bar .dot { width: 8px; height: 8px; border-radius: 50%; }
-  .dot.online { background: #4ec9b0; }
-  .dot.offline { background: #f44747; }
+  .dot.online { background: var(--success); }
+  .dot.offline { background: var(--danger); }
   #status-bar .model-name { color: var(--accent); font-weight: 600; }
   #status-bar .endpoint { opacity: 0.6; }
+  #status-bar .harness-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: var(--accent); color: var(--bg); font-weight: 600; }
+  #status-bar .version { margin-left: auto; font-size: 10px; opacity: 0.5; }
   #status-bar button { background: none; border: 1px solid var(--border); color: var(--fg); padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; }
 
   /* System prompt */
@@ -147,14 +299,49 @@ function getPlaygroundHTML(): string {
   .msg { max-width: 90%; padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }
   .msg.user { background: var(--user-bg); align-self: flex-end; border-bottom-right-radius: 2px; }
   .msg.assistant { background: var(--ai-bg); align-self: flex-start; border-bottom-left-radius: 2px; border: 1px solid var(--border); }
-  .msg.error { color: #f44747; border: 1px solid #f44747; align-self: center; font-size: 12px; }
-  .msg code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-size: 12px; }
-  .msg pre { background: rgba(0,0,0,0.3); padding: 8px; border-radius: 4px; overflow-x: auto; margin: 6px 0; }
+  .msg.error { color: var(--danger); border: 1px solid var(--danger); align-self: center; font-size: 12px; }
+  .msg.system-info { color: var(--warning); font-size: 11px; align-self: center; opacity: 0.8; font-style: italic; }
+
+  /* Markdown in assistant messages */
+  .msg.assistant .md-content h1, .msg.assistant .md-content h2, .msg.assistant .md-content h3 { margin: 8px 0 4px; }
+  .msg.assistant .md-content h1 { font-size: 16px; }
+  .msg.assistant .md-content h2 { font-size: 14px; }
+  .msg.assistant .md-content h3 { font-size: 13px; }
+  .msg.assistant .md-content p { margin: 4px 0; }
+  .msg.assistant .md-content ul, .msg.assistant .md-content ol { padding-left: 20px; margin: 4px 0; }
+  .msg.assistant .md-content strong { font-weight: 700; }
+  .msg.assistant .md-content em { font-style: italic; }
+
+  /* Inline code */
+  .msg code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-size: 12px; font-family: var(--vscode-editor-font-family, monospace); }
+
+  /* Code blocks */
+  .code-block-wrapper { position: relative; margin: 6px 0; }
+  .code-block-header { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; background: rgba(255,255,255,0.05); border-radius: 4px 4px 0 0; border: 1px solid var(--border); border-bottom: none; font-size: 11px; opacity: 0.7; }
+  .code-block-actions { display: flex; gap: 4px; }
+  .code-block-actions button { padding: 2px 8px; font-size: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.05); color: var(--fg); border-radius: 3px; cursor: pointer; }
+  .code-block-actions button:hover { background: rgba(255,255,255,0.15); }
+  .msg pre { background: rgba(0,0,0,0.3); padding: 8px; border-radius: 0 0 4px 4px; overflow-x: auto; margin: 0; border: 1px solid var(--border); border-top: none; }
   .msg pre code { background: none; padding: 0; }
 
+  /* Tool call cards */
+  .tool-card { margin: 6px 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; background: rgba(255,255,255,0.03); }
+  .tool-card-header { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .tool-card-icon { font-size: 14px; }
+  .tool-card-name { font-weight: 600; color: var(--accent); }
+  .tool-card-path { opacity: 0.7; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
+  .tool-card-status { margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 8px; }
+  .tool-card-status.pending { color: var(--warning); border: 1px solid var(--warning); }
+  .tool-card-status.success { color: var(--success); border: 1px solid var(--success); }
+  .tool-card-status.failed { color: var(--danger); border: 1px solid var(--danger); }
+  .tool-card-output { margin-top: 6px; padding: 6px; background: rgba(0,0,0,0.2); border-radius: 4px; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; max-height: 150px; overflow-y: auto; white-space: pre-wrap; }
+
   /* Streaming cursor */
-  .streaming::after { content: "▊"; animation: blink 0.8s infinite; color: var(--accent); }
+  .streaming::after { content: "\\25ca"; animation: blink 0.8s infinite; color: var(--accent); }
   @keyframes blink { 50% { opacity: 0; } }
+
+  /* Iteration badge */
+  .iteration-badge { font-size: 10px; padding: 2px 8px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 10px; align-self: center; color: var(--accent); }
 
   /* Input area */
   #input-area { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); flex-shrink: 0; align-items: flex-end; }
@@ -162,6 +349,7 @@ function getPlaygroundHTML(): string {
   #input-area button { padding: 8px 16px; background: var(--button-bg); color: var(--button-fg); border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; white-space: nowrap; }
   #input-area button:disabled { opacity: 0.5; cursor: not-allowed; }
   #clear-btn { background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 8px 12px; }
+  #stop-btn { background: var(--danger); display: none; }
 </style>
 </head>
 <body>
@@ -169,6 +357,8 @@ function getPlaygroundHTML(): string {
     <span class="dot" id="status-dot"></span>
     <span class="model-name" id="model-name">—</span>
     <span class="endpoint" id="endpoint-label"></span>
+    <span class="harness-badge" id="harness-badge" style="display:none">HARNESS</span>
+    <span class="version" id="version-label">v—</span>
     <button id="refresh-btn" title="Refresh connection">↻</button>
   </div>
   <div id="system-bar">
@@ -182,6 +372,7 @@ function getPlaygroundHTML(): string {
     <button id="clear-btn" title="Clear conversation">✕</button>
     <textarea id="user-input" rows="1" placeholder="Ask your local model anything..."></textarea>
     <button id="send-btn">Send</button>
+    <button id="stop-btn">Stop</button>
   </div>
 
 <script>
@@ -189,12 +380,15 @@ function getPlaygroundHTML(): string {
   const chat = document.getElementById("chat");
   const input = document.getElementById("user-input");
   const sendBtn = document.getElementById("send-btn");
+  const stopBtn = document.getElementById("stop-btn");
   const clearBtn = document.getElementById("clear-btn");
   const refreshBtn = document.getElementById("refresh-btn");
   const systemPrompt = document.getElementById("system-prompt");
   const statusDot = document.getElementById("status-dot");
   const modelName = document.getElementById("model-name");
   const endpointLabel = document.getElementById("endpoint-label");
+  const harnessBadge = document.getElementById("harness-badge");
+  const versionLabel = document.getElementById("version-label");
 
   let streaming = false;
   let currentAssistantEl = null;
@@ -215,11 +409,21 @@ function getPlaygroundHTML(): string {
   });
 
   sendBtn.addEventListener("click", send);
+  stopBtn.addEventListener("click", () => {
+    vscode.postMessage({ type: "cancelStream" });
+  });
   clearBtn.addEventListener("click", () => {
     vscode.postMessage({ type: "clear" });
     chat.innerHTML = "";
   });
   refreshBtn.addEventListener("click", () => vscode.postMessage({ type: "refresh" }));
+
+  function setStreaming(active) {
+    streaming = active;
+    sendBtn.style.display = active ? "none" : "";
+    stopBtn.style.display = active ? "" : "none";
+    sendBtn.disabled = active;
+  }
 
   function send() {
     const text = input.value.trim();
@@ -228,19 +432,145 @@ function getPlaygroundHTML(): string {
     vscode.postMessage({ type: "send", text, systemPrompt: systemPrompt.value });
     input.value = "";
     input.style.height = "auto";
-    sendBtn.disabled = true;
   }
 
-  function addMessage(role, text) {
+  function addMessage(role, content) {
     const el = document.createElement("div");
     el.className = "msg " + role;
-    el.textContent = text;
+    if (role === "assistant") {
+      el.innerHTML = '<div class="md-content">' + renderMarkdown(content) + '</div>';
+    } else {
+      el.textContent = content;
+    }
     chat.appendChild(el);
     chat.scrollTop = chat.scrollHeight;
     return el;
   }
 
-  // Message handler
+  function addSystemInfo(text) {
+    const el = document.createElement("div");
+    el.className = "msg system-info";
+    el.textContent = text;
+    chat.appendChild(el);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  // ── Simple markdown renderer ──────────────────────────────────
+
+  var codeBlockRe = new RegExp("" + String.fromCharCode(96,96,96) + "(\\\\w*)\\\\n([\\\\s\\\\S]*?)" + String.fromCharCode(96,96,96), "g");
+  var inlineCodeRe = new RegExp(String.fromCharCode(96) + "([^" + String.fromCharCode(96) + "]+)" + String.fromCharCode(96), "g");
+
+  function renderMarkdown(text) {
+    if (!text) return "";
+    // Escape HTML first
+    let html = text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+    // Code blocks with language and action buttons
+    html = html.replace(codeBlockRe, function(_, lang, code) {
+      var langLabel = lang || "text";
+      var escapedCode = code.replace(/\\n$/, "");
+      var id = "cb_" + Math.random().toString(36).slice(2, 8);
+      return '<div class="code-block-wrapper">' +
+        '<div class="code-block-header">' +
+          '<span>' + langLabel + '</span>' +
+          '<div class="code-block-actions">' +
+            "<button onclick=\\"copyCode('" + id + "')\\">Copy</button>" +
+            "<button onclick=\\"insertCode('" + id + "')\\">Insert</button>" +
+          '</div>' +
+        '</div>' +
+        '<pre><code id="' + id + '">' + escapedCode + '</code></pre>' +
+      '</div>';
+    });
+
+    // Inline code
+    html = html.replace(inlineCodeRe, "<code>$1</code>");
+
+    // Headers
+    html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+    html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+    html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+
+    // Bold and italic
+    html = html.replace(/[*][*](.+?)[*][*]/g, "<strong>$1</strong>");
+    html = html.replace(/[*](.+?)[*]/g, "<em>$1</em>");
+
+    // Unordered list items
+    html = html.replace(/^[-*] (.+)$/gm, "<li>$1</li>");
+
+    // Paragraphs (double newline)
+    html = html.replace(/\\n\\n/g, "</p><p>");
+
+    return "<p>" + html + "</p>";
+  }
+
+  function copyCode(id) {
+    const el = document.getElementById(id);
+    if (el) navigator.clipboard.writeText(el.textContent || "");
+  }
+
+  function insertCode(id) {
+    const el = document.getElementById(id);
+    if (el) vscode.postMessage({ type: "insertCode", code: el.textContent || "" });
+  }
+
+  // ── Tool call card rendering ──────────────────────────────────
+
+  function addToolCard(tool) {
+    const el = document.createElement("div");
+    el.className = "tool-card";
+    el.id = "tool_" + tool.id;
+
+    let icon, detail;
+    switch (tool.tool.type) {
+      case "read_file":
+        icon = "📖"; detail = tool.tool.path; break;
+      case "write_file":
+        icon = "📝"; detail = tool.tool.path; break;
+      case "edit_file":
+        icon = "✏️"; detail = tool.tool.path; break;
+      case "run_command":
+        icon = "⚡"; detail = tool.tool.command; break;
+      default:
+        icon = "🔧"; detail = "";
+    }
+
+    el.innerHTML =
+      '<div class="tool-card-header">' +
+        '<span class="tool-card-icon">' + icon + '</span>' +
+        '<span class="tool-card-name">' + tool.tool.type + '</span>' +
+        '<span class="tool-card-path">' + escapeHtml(detail) + '</span>' +
+        '<span class="tool-card-status pending" id="ts_' + tool.id + '">pending</span>' +
+      '</div>';
+
+    chat.appendChild(el);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function updateToolCard(id, success, output) {
+    const statusEl = document.getElementById("ts_" + id);
+    if (statusEl) {
+      statusEl.className = "tool-card-status " + (success ? "success" : "failed");
+      statusEl.textContent = success ? "done" : "failed";
+    }
+    const cardEl = document.getElementById("tool_" + id);
+    if (cardEl && output) {
+      const outEl = document.createElement("div");
+      outEl.className = "tool-card-output";
+      outEl.textContent = output.slice(0, 1000);
+      cardEl.appendChild(outEl);
+      chat.scrollTop = chat.scrollHeight;
+    }
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  // ── Message handler ───────────────────────────────────────────
+
   window.addEventListener("message", (e) => {
     const msg = e.data;
     switch (msg.type) {
@@ -248,27 +578,50 @@ function getPlaygroundHTML(): string {
         statusDot.className = "dot " + (msg.alive ? "online" : "offline");
         modelName.textContent = msg.model || "no model";
         endpointLabel.textContent = msg.endpoint;
+        harnessBadge.style.display = msg.harnessEnabled ? "" : "none";
+        versionLabel.textContent = "v" + (msg.version || "?");
         break;
       case "streamStart":
-        streaming = true;
+        setStreaming(true);
         currentText = "";
         currentAssistantEl = addMessage("assistant", "");
         currentAssistantEl.classList.add("streaming");
+        if (msg.iteration > 1) {
+          addSystemInfo("Step " + msg.iteration + "/" + msg.maxIterations);
+        }
         break;
       case "streamToken":
         currentText += msg.token;
-        if (currentAssistantEl) currentAssistantEl.textContent = currentText;
+        if (currentAssistantEl) {
+          const mdContent = currentAssistantEl.querySelector(".md-content");
+          if (mdContent) {
+            mdContent.textContent = currentText;
+          } else {
+            currentAssistantEl.textContent = currentText;
+          }
+        }
         chat.scrollTop = chat.scrollHeight;
         break;
       case "streamEnd":
-        streaming = false;
-        sendBtn.disabled = false;
-        if (currentAssistantEl) currentAssistantEl.classList.remove("streaming");
+        setStreaming(false);
+        if (currentAssistantEl) {
+          currentAssistantEl.classList.remove("streaming");
+          // Re-render with markdown now that streaming is done
+          const mdContent = currentAssistantEl.querySelector(".md-content");
+          if (mdContent) {
+            mdContent.innerHTML = renderMarkdown(currentText);
+          }
+        }
+        if (msg.cancelled) {
+          addSystemInfo("Cancelled by user");
+        }
+        if (msg.maxReached) {
+          addSystemInfo("Max tool iterations reached");
+        }
         currentAssistantEl = null;
         break;
       case "streamError":
-        streaming = false;
-        sendBtn.disabled = false;
+        setStreaming(false);
         if (currentAssistantEl) {
           currentAssistantEl.classList.remove("streaming");
           currentAssistantEl.classList.add("error");
@@ -278,8 +631,13 @@ function getPlaygroundHTML(): string {
         }
         currentAssistantEl = null;
         break;
+      case "toolCallDetected":
+        addToolCard(msg);
+        break;
+      case "toolCallResult":
+        updateToolCard(msg.id, msg.success, msg.output);
+        break;
       case "cleared":
-        // Already cleared DOM above
         break;
     }
   });

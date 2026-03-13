@@ -13,6 +13,8 @@ import {
 import { openPlayground } from "./playground";
 import { SidebarViewProvider } from "./sidebar";
 
+let outputChannel: vscode.OutputChannel | undefined;
+
 // ────────────────────────────────────────────────────────────────
 // Activation
 // ────────────────────────────────────────────────────────────────
@@ -29,11 +31,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Refresh sidebar when config changes
-  vscode.workspace.onDidChangeConfiguration((e) => {
-    if (e.affectsConfiguration("localai")) sidebarProvider.refresh();
-  });
-
   // Status bar item showing connection state
   const statusItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
@@ -43,9 +40,12 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(statusItem);
   updateStatus(statusItem);
 
-  // Refresh status when config changes
+  // Refresh sidebar and status when config changes (single listener)
   vscode.workspace.onDidChangeConfiguration((e) => {
-    if (e.affectsConfiguration("localai")) updateStatus(statusItem);
+    if (e.affectsConfiguration("localai")) {
+      sidebarProvider.refresh();
+      updateStatus(statusItem);
+    }
   });
 
   // ── Commands ────────────────────────────────────────────────
@@ -264,11 +264,12 @@ async function showStreamingOutput(
   prompt: { system: string; user: string },
   title: string
 ) {
-  const outputChannel = vscode.window.createOutputChannel(
-    `LocalAI — ${title}`
-  );
-  outputChannel.show(true);
-  outputChannel.clear();
+  if (!outputChannel) {
+    outputChannel = vscode.window.createOutputChannel("LocalAI");
+  }
+  const ch = outputChannel;
+  ch.clear();
+  ch.show(true);
 
   const source = new vscode.CancellationTokenSource();
 
@@ -280,11 +281,11 @@ async function showStreamingOutput(
           { role: "user", content: prompt.user },
         ],
       },
-      (token) => outputChannel.append(token),
+      (token) => ch.append(token),
       source.token
     );
   } catch (err: any) {
-    outputChannel.appendLine(`\n\n--- Error: ${err.message} ---`);
+    ch.appendLine(`\n\n--- Error: ${err.message} ---`);
   } finally {
     source.dispose();
   }

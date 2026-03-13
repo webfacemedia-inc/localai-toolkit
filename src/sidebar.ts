@@ -48,12 +48,16 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         models = list.map((m) => m.id);
       } catch {}
     }
+    const ext = vscode.extensions.getExtension("webfacemedia.localai-toolkit");
+    const version = ext?.packageJSON?.version ?? "dev";
+
     this._view.webview.postMessage({
       type: "status",
       alive,
       endpoint,
       model,
       models,
+      version,
     });
   }
 
@@ -181,6 +185,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
   <button onclick="send('switchModel')">🔄 Switch Model</button>
   <button onclick="cmd('localai.listModels')">📋 List Models</button>
 
+  <div class="info" id="version-info" style="margin-top:16px; font-size:10px; opacity:0.4; text-align:center;"></div>
+
   <script>
     const vscode = acquireVsCodeApi();
 
@@ -214,6 +220,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
           html += "<br><strong>Model:</strong> " + msg.models[0] + " (auto)";
         }
         info.innerHTML = html;
+        var vi = document.getElementById("version-info");
+        if (vi) vi.textContent = "LocalAI Toolkit v" + (msg.version || "?");
       }
     });
 

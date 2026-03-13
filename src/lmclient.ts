@@ -36,7 +36,6 @@ function getConfig() {
     model: cfg.get<string>("model", ""),
     temperature: cfg.get<number>("temperature", 0.3),
     maxTokens: cfg.get<number>("maxTokens", 2048),
-    stream: cfg.get<boolean>("streamResponses", true),
   };
 }
 
@@ -75,12 +74,16 @@ function streamRequest(
   return new Promise((resolve, reject) => {
     const lib = url.startsWith("https") ? https : http;
     let full = "";
+    let buffer = "";
     const req = lib.request(url, options, (res) => {
       res.on("data", (chunk: Buffer) => {
-        const lines = chunk.toString().split("\n");
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? ""; // keep incomplete last line
         for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const payload = line.slice(6).trim();
+          const trimmed = line.replace(/\r$/, "");
+          if (!trimmed.startsWith("data: ")) continue;
+          const payload = trimmed.slice(6).trim();
           if (payload === "[DONE]") continue;
           try {
             const parsed = JSON.parse(payload);
@@ -112,12 +115,14 @@ function streamRequest(
 // Public API
 // ────────────────────────────────────────────────────────────────
 
-/** Check if the LM Studio server is reachable */
+/** Check if the LM Studio server is reachable and has models loaded */
 export async function healthCheck(): Promise<boolean> {
   const { endpoint } = getConfig();
   try {
-    const { status } = await request(`${endpoint}/v1/models`, { method: "GET" });
-    return status === 200;
+    const { status, data } = await request(`${endpoint}/v1/models`, { method: "GET" });
+    if (status !== 200) return false;
+    const parsed = JSON.parse(data);
+    return Array.isArray(parsed.data) && parsed.data.length > 0;
   } catch {
     return false;
   }
@@ -129,9 +134,13 @@ export async function listModels(): Promise<ModelInfo[]> {
   const { status, data } = await request(`${endpoint}/v1/models`, {
     method: "GET",
   });
-  if (status !== 200) throw new Error(`LM Studio returned ${status}: ${data}`);
-  const parsed = JSON.parse(data);
-  return parsed.data ?? [];
+  if (status !== 200) throw new Error(`LM Studio returned ${status}: ${data.slice(0, 500)}`);
+  try {
+    const parsed = JSON.parse(data);
+    return Array.isArray(parsed.data) ? parsed.data : [];
+  } catch {
+    throw new Error("Invalid JSON response from LM Studio");
+  }
 }
 
 /** Non-streaming completion */

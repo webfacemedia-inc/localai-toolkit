@@ -20,15 +20,27 @@ Select any code, right-click → **LocalAI Toolkit**:
 - **Translate Selection** — translate text/comments to English, French, or Spanish (configurable)
 - **Custom Prompt** — type any instruction to run on the selection
 
+### 🛠 AI Harness (v0.2.0)
+`Cmd+Shift+L` — opens the playground with **harness mode** enabled. Your local model can:
+- **Read files** from your workspace (auto-approved by default)
+- **Write/create files** with confirmation and diff preview
+- **Edit files** via search/replace with confirmation
+- **Run shell commands** with confirmation and output capture
+- **Fetch URLs** to pull documentation, API responses, or reference material from the web
+
+The harness uses an agentic loop: the model streams a response, tool calls are parsed and executed, results are fed back, and the model continues — up to 10 iterations per message (configurable). All write/command operations require explicit user approval.
+
+Uses prompt-based XML tool calling for universal model compatibility (works with any local model, no function calling support required). URL fetching includes safety guards (public URLs only, no localhost/private IPs, 64KB response limit, HTML tag stripping).
+
 ### 💬 Chat Playground
-`Cmd+Shift+L` — opens a streaming chat panel beside your editor. Set a system prompt, test models, iterate on prompts. Full conversation memory within the session.
+The playground supports streaming chat with conversation memory, markdown rendering, code blocks with Copy/Insert buttons, and a system prompt input. When harness mode is disabled, it works as a simple chat interface.
 
 ### 🔌 Model Management
 - **List Models** — see what's loaded in LM Studio
 - **Switch Model** — quick-pick to change the active model
 
 ### Status Bar
-Shows connection state and current model at a glance. Click to open the playground.
+Shows connection state, current model, and extension version. Click to open the playground.
 
 ---
 
@@ -38,12 +50,11 @@ Shows connection state and current model at a glance. Click to open the playgrou
 ```bash
 cd localai-toolkit
 npm install
-npm run compile
+npm run package
+code --install-extension localai-toolkit-0.2.2.vsix --force
 ```
 
-Then either:
-- **Dev mode:** Press `F5` in VS Code to launch Extension Host
-- **Package:** `npm run package` → install the `.vsix` file
+Or dev mode: press `F5` in VS Code to launch Extension Host.
 
 ### 2. Configure LM Studio
 Make sure LM Studio's local server is running (default: `http://localhost:1234`).
@@ -61,7 +72,17 @@ Open VS Code Settings → search "LocalAI":
 | `localai.maxTokens` | `2048` | Max response tokens |
 | `localai.commitStyle` | `conventional` | `conventional` / `descriptive` / `brief` |
 | `localai.languages` | `["English","French","Spanish"]` | Translation targets |
-| `localai.streamResponses` | `true` | Stream in playground & explain |
+
+#### Harness Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `localai.harness.enabled` | `true` | Enable tool use in the playground |
+| `localai.harness.maxTokens` | `4096` | Max tokens for harness responses |
+| `localai.harness.maxIterations` | `10` | Max tool-use iterations per message |
+| `localai.harness.commandTimeout` | `30000` | Timeout (ms) for shell commands |
+| `localai.harness.autoApproveReads` | `true` | Auto-approve file reads |
+| `localai.harness.blockedCommands` | `["rm -rf /", ...]` | Blocked command patterns |
 
 ---
 
@@ -71,7 +92,7 @@ Open VS Code Settings → search "LocalAI":
 |---|---|
 | `Cmd+Shift+G` | Generate commit message |
 | `Cmd+Shift+E` | Explain selection |
-| `Cmd+Shift+L` | Open playground |
+| `Cmd+Shift+L` | Open playground / harness |
 | `Cmd+Shift+P` | Custom prompt on selection |
 
 ---
@@ -80,10 +101,13 @@ Open VS Code Settings → search "LocalAI":
 
 ```
 src/
-  extension.ts   — command registration, Git integration, selection tools
-  lmclient.ts    — LM Studio API client (streaming + non-streaming)
-  prompts.ts     — prompt templates for all tools
-  playground.ts  — webview chat panel
+  extension.ts     — command registration, Git integration, selection tools
+  lmclient.ts      — LM Studio API client (streaming + non-streaming, buffered SSE)
+  prompts.ts       — prompt templates for all tools + harness system prompt
+  playground.ts    — webview chat panel with agentic harness loop
+  sidebar.ts       — activity bar sidebar with status and quick actions
+  toolparser.ts    — XML tool call parser (extracts structured tool calls from LLM output)
+  toolexecutor.ts  — tool execution engine (read/write/edit files, run commands) with safety gates
 ```
 
 Zero external runtime dependencies. Uses Node's built-in `http`/`https` for API calls.
@@ -98,6 +122,12 @@ Works with any OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp server, 
 2. Add a case in `runSelectionTool()` in `extension.ts`
 3. Register the command in `package.json` under `contributes.commands`
 
+**Add a harness tool:**
+1. Add the type to `ToolCall` union in `toolparser.ts`
+2. Add parsing logic in `parseToolCalls()`
+3. Add execution logic in `toolexecutor.ts`
+4. Document the tool in `harnessSystemPrompt()` in `prompts.ts`
+
 **Use with Ollama or other backends:**
 Just change `localai.endpoint` to `http://localhost:11434` (Ollama) or whatever your server runs on.
 
@@ -110,6 +140,8 @@ Just change `localai.endpoint` to `http://localhost:11434` (Ollama) or whatever 
 - [ ] Integrate with Webface Control MCP server (Phase 5)
 - [ ] RAG: index workspace files for context-aware chat
 - [ ] Prompt library: save/load custom prompts
+- [ ] Diff preview in webview for file edits (instead of native dialog)
+- [ ] Inline approve/reject buttons in webview for tool calls
 
 ---
 
