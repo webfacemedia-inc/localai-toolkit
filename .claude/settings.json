@@ -2,7 +2,19 @@
   "permissions": {
     "allow": [
       "Bash(code --install-extension localai-toolkit-0.5.4.vsix --force)",
-      "Bash(code --install-extension localai-toolkit-0.5.5.vsix --force)"
+      "Bash(code --install-extension localai-toolkit-0.5.5.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.5.7.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.6.0.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.6.1.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.6.2.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.6.3.vsix --force)",
+      "Bash(code --install-extension /Users/webfacemedia/PROJECTS/2026/vscode-plugin/localai-toolkit-0.6.4.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.6.6.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.6.7.vsix --force)",
+      "Bash(code --install-extension localai-toolkit-0.6.8.vsix --force)",
+      "Bash(code --install-extension /Users/webfacemedia/PROJECTS/2026/vscode-plugin/localai-toolkit-0.6.9.vsix --force)",
+      "Bash(code --install-extension /Users/webfacemedia/PROJECTS/2026/vscode-plugin/localai-toolkit-0.7.0.vsix --force)",
+      "Bash(code --install-extension /Users/webfacemedia/PROJECTS/2026/vscode-plugin/localai-toolkit-0.7.3.vsix --force)"
     ]
   }
 }

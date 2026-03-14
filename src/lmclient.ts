@@ -25,6 +25,11 @@ export interface ModelInfo {
   owned_by?: string;
 }
 
+export interface StreamResult {
+  text: string;
+  finishReason: string;
+}
+
 // ────────────────────────────────────────────────────────────────
 // Config helper
 // ────────────────────────────────────────────────────────────────
@@ -70,12 +75,13 @@ function streamRequest(
   body: string,
   onToken: (token: string) => void,
   cancel: vscode.CancellationToken
-): Promise<string> {
+): Promise<StreamResult> {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith("https") ? https : http;
     let full = "";
     let buffer = "";
     let inThinking = false;
+    let finishReason = "stop";
     const req = lib.request(url, options, (res) => {
       res.on("data", (chunk: Buffer) => {
         buffer += chunk.toString();
@@ -88,7 +94,15 @@ function streamRequest(
           if (payload === "[DONE]") continue;
           try {
             const parsed = JSON.parse(payload);
-            const delta = parsed.choices?.[0]?.delta;
+            const choice = parsed.choices?.[0];
+            if (!choice) continue;
+
+            // Capture finish_reason to detect truncation
+            if (choice.finish_reason) {
+              finishReason = choice.finish_reason;
+            }
+
+            const delta = choice.delta;
             if (!delta) continue;
 
             // Qwen3/reasoning models may send thinking tokens via
@@ -126,7 +140,7 @@ function streamRequest(
         if (inThinking) {
           full += "</think>\n\n";
         }
-        resolve(full);
+        resolve({ text: full, finishReason });
       });
     });
     req.on("error", reject);
@@ -200,7 +214,7 @@ export async function completeStream(
   opts: CompletionOptions,
   onToken: (token: string) => void,
   cancel: vscode.CancellationToken
-): Promise<string> {
+): Promise<StreamResult> {
   const cfg = getConfig();
   const endpoint = `${cfg.endpoint}/v1/chat/completions`;
   const body = JSON.stringify({

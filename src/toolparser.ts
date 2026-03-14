@@ -6,6 +6,8 @@
 export interface ReadFileCall {
   type: "read_file";
   path: string;
+  startLine?: number;
+  endLine?: number;
 }
 
 export interface WriteFileCall {
@@ -76,7 +78,8 @@ const TOOL_ALIASES: Record<string, string> = {
   http: "fetch_url",
 };
 
-const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)<\/tool_call>/g;
+// Match tool_call blocks — models may close with various tags
+const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)<\/(?:tool_call|invoke|function|tool|command|content)>/g;
 
 /**
  * Extract a tag value, handling multiple formats models use:
@@ -101,6 +104,12 @@ function extractTag(xml: string, tag: string): string | undefined {
   const attrMatch = xml.match(attrRe);
   if (attrMatch) return attrMatch[1].trim();
 
+  // Unclosed: <tag>value (tag opened but body ended before closing tag)
+  // Handles malformed blocks where </command> closed the outer block early
+  const unclosedRe = new RegExp(`<${tag}>\\s*([\\w._/-]+)\\s*$`);
+  const unclosedMatch = xml.match(unclosedRe);
+  if (unclosedMatch) return unclosedMatch[1].trim();
+
   return undefined;
 }
 
@@ -123,6 +132,10 @@ function extractToolName(body: string): string | undefined {
     }
   }
 
+  // Raw text: body might just be "run_command" or contain a tool name without proper tags
+  const stripped = body.replace(/<[^>]*>/g, "").trim();
+  if (VALID_TOOLS.includes(stripped) || TOOL_ALIASES[stripped]) return stripped;
+
   return undefined;
 }
 
@@ -134,6 +147,9 @@ export function parseToolCalls(text: string): ToolCall[] {
   TOOL_CALL_RE.lastIndex = 0;
   while ((match = TOOL_CALL_RE.exec(text)) !== null) {
     const body = match[1];
+    // When </command> acts as the tool_call closer, the real command tag
+    // may be in the text immediately following this match. Capture lookahead.
+    const afterMatch = text.slice(match.index + match[0].length, match.index + match[0].length + 500);
     let name = extractToolName(body);
     if (!name) continue;
 
@@ -168,7 +184,14 @@ export function parseToolCalls(text: string): ToolCall[] {
         const path = extractTag(body, "path")?.trim()
           || extractTag(body, "file")?.trim()
           || extractTag(body, "filename")?.trim();
-        if (path) calls.push({ type: "read_file", path });
+        if (path) {
+          const startStr = extractTag(body, "start_line")?.trim();
+          const endStr = extractTag(body, "end_line")?.trim();
+          const call: ReadFileCall = { type: "read_file", path };
+          if (startStr) call.startLine = parseInt(startStr, 10) || undefined;
+          if (endStr) call.endLine = parseInt(endStr, 10) || undefined;
+          calls.push(call);
+        }
         break;
       }
       case "write_file": {
@@ -220,8 +243,14 @@ export function parseToolCalls(text: string): ToolCall[] {
         break;
       }
       case "run_command": {
-        const command = extractTag(body, "command")?.trim()
+        let command = extractTag(body, "command")?.trim()
           || extractTag(body, "cmd")?.trim();
+        // Fallback: when </command> closed the tool_call early, the actual
+        // command tag may be in the text right after the match
+        if (!command && afterMatch) {
+          command = extractTag(afterMatch, "command")?.trim()
+            || extractTag(afterMatch, "cmd")?.trim();
+        }
         if (command) calls.push({ type: "run_command", command });
         break;
       }
@@ -280,11 +309,11 @@ function synthesizeCommand(alias: string, body: string): string | undefined {
 /** Detect if text has an incomplete tool_call block still being streamed */
 export function hasPartialToolCall(text: string): boolean {
   const openCount = (text.match(/<tool_call>/g) || []).length;
-  const closeCount = (text.match(/<\/tool_call>/g) || []).length;
+  const closeCount = (text.match(/<\/(?:tool_call|invoke|function|tool|command|content)>/g) || []).length;
   return openCount > closeCount;
 }
 
 /** Strip tool_call blocks from text, returning just the conversational parts */
 export function stripToolCalls(text: string): string {
-  return text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
+  return text.replace(/<tool_call>[\s\S]*?<\/(?:tool_call|invoke|function|tool|command|content)>/g, "").trim();
 }

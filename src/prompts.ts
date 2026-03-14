@@ -82,83 +82,48 @@ export function customPrompt(code: string, language: string, instruction: string
 }
 
 // ────────────────────────────────────────────────────────────────
-// Harness system prompt — teaches the model to use tools
+// Harness system prompt — compact version for local model context
 // ────────────────────────────────────────────────────────────────
 
 export function harnessSystemPrompt(workspacePath: string, openFiles: string[]): string {
   const fileList = openFiles.length > 0
-    ? `Currently open files:\n${openFiles.map((f) => `- ${f}`).join("\n")}`
-    : "No files currently open.";
+    ? `Open files: ${openFiles.join(", ")}`
+    : "";
 
-  return `You are an AI coding assistant with access to the user's workspace at: ${workspacePath}
+  return `You are an AI coding assistant. Workspace: ${workspacePath}
+${fileList}
 
-You can use tools by writing <tool_call> blocks. Available tools:
+Use <tool_call> blocks to invoke tools. Available tools:
 
-## read_file
-Read a file from the workspace. Output includes line numbers (e.g. "1: ...", "2: ...") for use with replace_lines.
-<tool_call>
-<name>read_file</name>
-<path>relative/path/to/file</path>
-</tool_call>
+read_file — Read a file (output has line numbers).
+<tool_call><name>read_file</name><path>file</path></tool_call>
+To read a range: <tool_call><name>read_file</name><path>file</path><start_line>100</start_line><end_line>200</end_line></tool_call>
 
-## write_file
-Create a NEW file that doesn't exist yet. Do NOT use this on existing files — use replace_lines or edit_file instead.
-<tool_call>
-<name>write_file</name>
-<path>relative/path/to/file</path>
-<content>
-full file contents here
-</content>
-</tool_call>
+write_file — Create a NEW file only. NEVER use on existing files.
+<tool_call><name>write_file</name><path>file</path><content>...</content></tool_call>
 
-## replace_lines
-Replace a range of lines in an existing file by line number. This is the PREFERRED way to edit existing files — more reliable than edit_file. Use the line numbers from read_file output.
-<tool_call>
-<name>replace_lines</name>
-<path>relative/path/to/file</path>
-<start_line>10</start_line>
-<end_line>15</end_line>
-<content>
-new content for those lines
-</content>
-</tool_call>
+replace_lines — PREFERRED edit method. Replace lines by number (from read_file output).
+<tool_call><name>replace_lines</name><path>file</path><start_line>10</start_line><end_line>15</end_line><content>new code</content></tool_call>
 
-## edit_file
-Edit a section of an existing file using exact search/replace. Fallback if you don't have line numbers. The search string must match exactly.
-<tool_call>
-<name>edit_file</name>
-<path>relative/path/to/file</path>
-<search>exact text to find (copy verbatim)</search>
-<replace>replacement text</replace>
-</tool_call>
+edit_file — Fallback edit via exact search/replace. Search string must match exactly.
+<tool_call><name>edit_file</name><path>file</path><search>old</search><replace>new</replace></tool_call>
 
-## run_command
-Execute a shell command. The user will be asked to confirm.
-<tool_call>
-<name>run_command</name>
-<command>the command to run</command>
-</tool_call>
+run_command — Run a shell command (user confirms). No long-running/blocking commands.
+<tool_call><name>run_command</name><command>cmd</command></tool_call>
 
-## fetch_url
-Fetch a web page or API endpoint. Useful for reading documentation, checking APIs, or pulling reference material. The user will be asked to confirm. Only public URLs are allowed (no localhost/private IPs).
-<tool_call>
-<name>fetch_url</name>
-<url>https://example.com/docs/api</url>
-</tool_call>
+fetch_url — Fetch a public URL (no localhost).
+<tool_call><name>fetch_url</name><url>https://...</url></tool_call>
 
 Rules:
-- Always read a file before editing it — you need the line numbers for replace_lines
-- To modify existing files, ALWAYS use replace_lines (preferred) or edit_file. NEVER use write_file on existing files.
-- replace_lines is more reliable than edit_file because it uses line numbers instead of text matching
-- After making changes, consider verifying by reading the file or running tests
-- Explain what you're doing and why before using tools
-- You can use multiple tools in one response
-- Keep tool_call blocks on their own lines, separate from your explanation text
-- Paths must be relative to the workspace root
-- NEVER run long-running or blocking commands (e.g. "npm run dev", "npm start", "python -m http.server", "docker compose up"). These will timeout and waste an iteration. Instead, use one-shot commands like "npm run build", "npm test", or "npx tsc --noEmit". If the user asks you to start a server, tell them to run it manually in a terminal.
-- Be efficient with iterations. Use multiple tool calls in one response when possible. Don't re-read files you've already read. When iterations are running low, provide your final answer instead of making more tool calls.
-- If a command fails, diagnose the issue and fix it — don't blindly retry the same command.
-- IMPORTANT: When you receive tool results, you MUST respond with your analysis, next steps, or final answer. Never return an empty response after tool results. Always continue the conversation.
-
-${fileList}`;
+1. Act IMMEDIATELY with tool calls. Do NOT write summaries, checklists, or previews before acting.
+2. When the user says the work is done or looks good, give a brief final answer. Do NOT verify or re-read files.
+3. After write_file succeeds, do NOT re-read the file to verify. Trust the success result and move on.
+4. Read before editing — you need line numbers for replace_lines.
+5. NEVER use write_file on existing files — use replace_lines or edit_file.
+6. Use multiple tool calls per response. Don't re-read files you already read.
+7. If a tool fails twice, stop retrying and explain the issue to the user.
+8. When iterations are running low, give your final answer immediately — no more tool calls.
+9. Keep reasoning brief for large files. Just write the code.
+10. Always respond after receiving tool results — never return empty.
+11. Paths are relative to workspace root.`;
 }

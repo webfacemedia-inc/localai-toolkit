@@ -14,28 +14,13 @@ export interface ToolResult {
 // Syntax validation — catches common LLM edit mistakes
 // ────────────────────────────────────────────────────────────────
 
-function validateSyntax(content: string, filePath: string): string | null {
-  const ext = path.extname(filePath).toLowerCase();
+/** Check bracket/brace/paren balance in JavaScript/TypeScript code */
+function validateBrackets(code: string): string[] {
   const errors: string[] = [];
-
-  // JSON validation
-  if (ext === ".json") {
-    try {
-      JSON.parse(content);
-    } catch (e: any) {
-      return `JSON syntax error: ${e.message}`;
-    }
-    return null;
-  }
-
-  // Bracket/brace/paren balance for code files
-  const codeExts = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".css", ".scss", ".less"];
-  if (!codeExts.includes(ext)) return null;
-
   const pairs: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
   const closers: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
   const stack: { char: string; line: number }[] = [];
-  const lines = content.split("\n");
+  const lines = code.split("\n");
 
   let inString: string | null = null;
   let inTemplateLiteral = false;
@@ -51,52 +36,35 @@ function validateSyntax(content: string, filePath: string): string | null {
       const ch = line[i];
       const next = line[i + 1];
 
-      // Handle block comments
       if (inBlockComment) {
-        if (ch === "*" && next === "/") {
-          inBlockComment = false;
-          i++;
-        }
+        if (ch === "*" && next === "/") { inBlockComment = false; i++; }
         continue;
       }
-
-      // Handle line comments
       if (inLineComment) continue;
 
-      // Handle strings
       if (inString) {
         if (ch === "\\" ) { i++; continue; }
         if (ch === inString) { inString = null; }
         continue;
       }
 
-      // Handle template literals
       if (inTemplateLiteral && templateDepth === 0) {
         if (ch === "\\" ) { i++; continue; }
         if (ch === "`") { inTemplateLiteral = false; continue; }
-        if (ch === "$" && next === "{") {
-          templateDepth++;
-          i++;
-          continue;
-        }
+        if (ch === "$" && next === "{") { templateDepth++; i++; continue; }
         continue;
       }
 
-      // Start of comments
       if (ch === "/" && next === "/") { inLineComment = true; i++; continue; }
       if (ch === "/" && next === "*") { inBlockComment = true; i++; continue; }
-
-      // Start of strings
       if (ch === '"' || ch === "'") { inString = ch; continue; }
       if (ch === "`") { inTemplateLiteral = true; continue; }
 
-      // Template literal expression end
       if (inTemplateLiteral && templateDepth > 0 && ch === "}") {
         templateDepth--;
         if (templateDepth === 0) continue;
       }
 
-      // Bracket matching
       if (pairs[ch]) {
         stack.push({ char: ch, line: lineIdx + 1 });
       } else if (closers[ch]) {
@@ -114,23 +82,105 @@ function validateSyntax(content: string, filePath: string): string | null {
     }
   }
 
-  // Check unclosed brackets
   for (const item of stack) {
     errors.push(`Line ${item.line}: unclosed '${item.char}'`);
   }
 
+  return errors;
+}
+
+/** Detect duplicate function/method declarations in code */
+function detectDuplicateDeclarations(code: string): string[] {
+  const errors: string[] = [];
+  const declRe = /^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{/gm;
+  const methods: Record<string, number[]> = {};
+  let m: RegExpExecArray | null;
+  while ((m = declRe.exec(code)) !== null) {
+    const name = m[1];
+    if (["if", "for", "while", "switch", "catch", "function"].includes(name)) continue;
+    const line = code.slice(0, m.index).split("\n").length;
+    if (!methods[name]) methods[name] = [];
+    methods[name].push(line);
+  }
+  for (const [name, lines] of Object.entries(methods)) {
+    if (lines.length > 1) {
+      errors.push(`Duplicate method/function '${name}' at lines ${lines.join(", ")}`);
+    }
+  }
+  return errors;
+}
+
+function validateSyntax(content: string, filePath: string): string | null {
+  const ext = path.extname(filePath).toLowerCase();
+  const errors: string[] = [];
+
+  // JSON validation
+  if (ext === ".json") {
+    try {
+      JSON.parse(content);
+    } catch (e: any) {
+      return `JSON syntax error: ${e.message}`;
+    }
+    return null;
+  }
+
+  // HTML validation — check script blocks
+  if (ext === ".html" || ext === ".htm") {
+    // Check basic HTML tag balance
+    for (const tag of ["html", "head", "body"]) {
+      const openCount = (content.match(new RegExp(`<${tag}[\\s>]`, "gi")) || []).length;
+      const closeCount = (content.match(new RegExp(`</${tag}>`, "gi")) || []).length;
+      if (openCount !== closeCount) {
+        errors.push(`Mismatched <${tag}> tags: ${openCount} open, ${closeCount} close`);
+      }
+    }
+
+    // Extract and validate <script> blocks
+    const scriptRe = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    let scriptMatch: RegExpExecArray | null;
+    while ((scriptMatch = scriptRe.exec(content)) !== null) {
+      const scriptContent = scriptMatch[1];
+      const beforeScript = content.slice(0, scriptMatch.index);
+      const lineOffset = beforeScript.split("\n").length;
+
+      // Bracket balance
+      const bracketErrs = validateBrackets(scriptContent);
+      for (const err of bracketErrs) {
+        errors.push(err.replace(/Line (\d+)/, (_, n) => `Line ${parseInt(n) + lineOffset}`));
+      }
+
+      // Duplicate declarations
+      const dupErrs = detectDuplicateDeclarations(scriptContent);
+      for (const err of dupErrs) {
+        errors.push(err.replace(/lines? (\d+)/g, (match, n) => match.replace(n, String(parseInt(n) + lineOffset))));
+      }
+    }
+
+    if (errors.length > 0) {
+      return `SYNTAX WARNING after writing ${filePath}:\n${errors.slice(0, 5).join("\n")}\n\nPlease fix these issues before proceeding.`;
+    }
+    return null;
+  }
+
+  // Bracket/brace/paren balance for code files
+  const codeExts = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".css", ".scss", ".less"];
+  if (!codeExts.includes(ext)) return null;
+
+  errors.push(...validateBrackets(content));
+
   // Check for JSX-specific issues in JSX/TSX files
   if ([".jsx", ".tsx", ".js"].includes(ext)) {
-    // Detect duplicate adjacent closing tags like </button></button>
     const dupCloseRe = /(<\/(\w+)>)\s*\1/g;
     let m: RegExpExecArray | null;
-    const contentForSearch = content;
-    while ((m = dupCloseRe.exec(contentForSearch)) !== null) {
-      const before = contentForSearch.slice(0, m.index);
+    while ((m = dupCloseRe.exec(content)) !== null) {
+      const before = content.slice(0, m.index);
       const lineNum = before.split("\n").length;
       errors.push(`Line ${lineNum}: duplicate closing tag </${m[2]}> — likely a copy/paste error`);
     }
   }
+
+  // Duplicate declarations in code files
+  errors.push(...detectDuplicateDeclarations(content));
 
   if (errors.length > 0) {
     return `SYNTAX WARNING after editing ${filePath}:\n${errors.slice(0, 5).join("\n")}\n\nPlease fix these issues before proceeding.`;
@@ -146,8 +196,20 @@ function resolvePath(filePath: string): string | undefined {
   const root = getWorkspaceRoot();
   if (!root) return undefined;
 
-  // Reject absolute paths and traversal
-  if (path.isAbsolute(filePath) || filePath.includes("..")) return undefined;
+  // Auto-fix absolute paths that include workspace root
+  // Models often prepend the full workspace path despite being told to use relative paths
+  if (path.isAbsolute(filePath)) {
+    if (filePath.startsWith(root + path.sep)) {
+      filePath = filePath.slice(root.length + 1);
+    } else if (filePath.startsWith(root)) {
+      filePath = filePath.slice(root.length);
+      if (filePath.startsWith(path.sep)) filePath = filePath.slice(1);
+    } else {
+      return undefined; // truly foreign absolute path — reject
+    }
+  }
+
+  if (filePath.includes("..")) return undefined;
 
   const resolved = path.resolve(root, filePath);
   // Double-check it's still inside workspace
@@ -175,7 +237,7 @@ export async function executeTool(
 ): Promise<ToolResult> {
   switch (call.type) {
     case "read_file":
-      return executeReadFile(call.path);
+      return executeReadFile(call.path, call.startLine, call.endLine);
     case "write_file":
       return executeWriteFile(call.path, call.content, confirm);
     case "edit_file":
@@ -195,7 +257,7 @@ export async function executeTool(
 // read_file
 // ────────────────────────────────────────────────────────────────
 
-async function executeReadFile(filePath: string): Promise<ToolResult> {
+async function executeReadFile(filePath: string, startLine?: number, endLine?: number): Promise<ToolResult> {
   const resolved = resolvePath(filePath);
   if (!resolved) {
     return { success: false, output: `Invalid path: ${filePath}. Must be relative to workspace, no ".." allowed.` };
@@ -206,13 +268,32 @@ async function executeReadFile(filePath: string): Promise<ToolResult> {
     const bytes = await vscode.workspace.fs.readFile(uri);
     let content = Buffer.from(bytes).toString("utf-8");
 
-    // Add line numbers and truncate very large files
-    const lines = content.split("\n");
-    let numbered = lines.map((line, i) => `${i + 1}: ${line}`).join("\n");
+    const allLines = content.split("\n");
+    const totalLines = allLines.length;
+
+    // Support line range for reading sections of large files
+    let linesToShow: string[];
+    let rangeNote = "";
+    if (startLine && startLine > 0) {
+      const start = Math.max(0, startLine - 1); // Convert to 0-indexed
+      const end = endLine ? Math.min(endLine, totalLines) : totalLines;
+      linesToShow = allLines.slice(start, end);
+      rangeNote = ` (showing lines ${start + 1}-${Math.min(end, totalLines)} of ${totalLines})`;
+    } else {
+      linesToShow = allLines;
+    }
+
+    // Add line numbers (using original line numbers, not relative)
+    const offset = (startLine && startLine > 0) ? startLine - 1 : 0;
+    let numbered = linesToShow.map((line, i) => `${offset + i + 1}: ${line}`).join("\n");
 
     const MAX_READ = 16_000;
     if (numbered.length > MAX_READ) {
-      numbered = numbered.slice(0, MAX_READ) + `\n\n... (truncated at ${MAX_READ} chars, file has ${lines.length} lines total)`;
+      const truncatedLines = numbered.slice(0, MAX_READ).split("\n");
+      const lastLineNum = truncatedLines.length + offset;
+      numbered = numbered.slice(0, MAX_READ) + `\n\n... (truncated at ${MAX_READ} chars, showing up to line ~${lastLineNum}, file has ${totalLines} lines total. Use start_line/end_line to read specific sections.)`;
+    } else if (rangeNote) {
+      numbered += `\n${rangeNote}`;
     }
 
     return { success: true, output: numbered };
@@ -273,7 +354,7 @@ async function executeWriteFile(
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside, true);
 
-    let msg = `File created: ${filePath} (${content.length} chars)`;
+    let msg = `File created: ${filePath} (${content.length} chars). Do NOT re-read this file — it is complete.`;
     const syntaxErr = validateSyntax(content, filePath);
     if (syntaxErr) {
       msg += `\n\n${syntaxErr}`;

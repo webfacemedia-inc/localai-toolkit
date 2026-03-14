@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
-import { listModels, completeStream, ChatMessage, healthCheck } from "./lmclient";
-import { parseToolCalls } from "./toolparser";
+import { listModels, completeStream, ChatMessage, StreamResult, healthCheck } from "./lmclient";
+import { parseToolCalls, hasPartialToolCall } from "./toolparser";
 import { executeTool, ToolResult } from "./toolexecutor";
 import { harnessSystemPrompt } from "./prompts";
 
@@ -9,6 +9,16 @@ let conversationHistory: ChatMessage[] = [];
 let activeCancellation: vscode.CancellationTokenSource | undefined;
 let abortLoop = false;
 let sessionAutoApprove = false;
+
+/** Track how many times each file has been read in the current conversation */
+let readFileCounter: Record<string, number> = {};
+/** Track consecutive read-only iterations (no writes/commands) */
+let consecutiveReadOnlyIterations = 0;
+
+/** Rough token estimate: ~3.5 chars per token for English/code */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3.5);
+}
 
 /** Strip <think>...</think> blocks from text to save context window */
 function stripThinkBlocks(text: string): string {
@@ -43,6 +53,8 @@ export function openPlayground(context: vscode.ExtensionContext) {
           break;
         case "clear":
           conversationHistory = [];
+          readFileCounter = {};
+          consecutiveReadOnlyIterations = 0;
           panel?.webview.postMessage({ type: "cleared" });
           break;
         case "refresh":
@@ -72,6 +84,8 @@ export function openPlayground(context: vscode.ExtensionContext) {
   panel.onDidDispose(() => {
     panel = undefined;
     conversationHistory = [];
+    readFileCounter = {};
+    consecutiveReadOnlyIterations = 0;
     abortLoop = true;
     activeCancellation?.cancel();
   });
@@ -120,7 +134,9 @@ async function handleChat(userText: string, systemPrompt?: string) {
   const cfg = vscode.workspace.getConfiguration("localai.harness");
   const harnessEnabled = cfg.get<boolean>("enabled", true);
   const maxIterations = cfg.get<number>("maxIterations", 10);
-  const harnessMaxTokens = cfg.get<number>("maxTokens", 4096);
+  const rawMaxTokens = cfg.get<number>("maxTokens", 32768);
+  // Enforce minimum — stale workspace settings may have old default (4096)
+  const harnessMaxTokens = Math.max(rawMaxTokens, 16384);
   const autoApproveReads = cfg.get<boolean>("autoApproveReads", true);
   const autoApproveAll = sessionAutoApprove || cfg.get<boolean>("autoApproveAll", false);
 
@@ -142,22 +158,68 @@ async function handleChat(userText: string, systemPrompt?: string) {
     systemContent = systemPrompt.trim();
   }
 
+  let consecutiveFailures = 0;
+
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     if (abortLoop) break;
 
-    // Build messages for this iteration — strip <think> blocks from prior
-    // assistant messages to save context window for reasoning models.
+    // Build messages — adaptive trimming based on estimated token count.
+    // Local models often have small context windows (4K-16K tokens).
+    // We aggressively trim to keep prompt tokens under budget.
+    const MAX_PROMPT_TOKENS = 6000; // Conservative for local models
+    const MSG_TRUNCATE_LEN = 4000; // Max chars per message when trimming
+
+    let trimmedHistory = [...conversationHistory];
+
     const messages: ChatMessage[] = [];
     if (systemContent) {
       messages.push({ role: "system", content: systemContent });
     }
-    for (const msg of conversationHistory) {
-      if (msg.role === "assistant") {
-        messages.push({ role: "assistant", content: stripThinkBlocks(msg.content) });
-      } else {
-        messages.push(msg);
+
+    // First pass: build messages with truncation
+    const buildMessages = (history: ChatMessage[], truncateLen: number): ChatMessage[] => {
+      const msgs: ChatMessage[] = [];
+      for (const msg of history) {
+        if (msg.role === "assistant") {
+          const stripped = stripThinkBlocks(msg.content);
+          const content = stripped.length > truncateLen
+            ? stripped.slice(0, truncateLen) + "\n... [truncated]"
+            : stripped;
+          msgs.push({ role: "assistant", content });
+        } else {
+          const content = msg.content.length > truncateLen
+            ? msg.content.slice(0, truncateLen) + "\n... [truncated]"
+            : msg.content;
+          msgs.push({ role: msg.role, content });
+        }
       }
+      return msgs;
+    };
+
+    // Adaptive trimming: drop oldest messages until under token budget
+    let historyMessages = buildMessages(trimmedHistory, MSG_TRUNCATE_LEN);
+    let allMessages = [...messages, ...historyMessages];
+    let estimatedTotal = estimateTokens(allMessages.map(m => m.content).join(""));
+
+    while (estimatedTotal > MAX_PROMPT_TOKENS && trimmedHistory.length > 4) {
+      // Drop the 2 oldest messages (usually a user+assistant pair)
+      trimmedHistory = trimmedHistory.slice(2);
+      historyMessages = buildMessages(trimmedHistory, MSG_TRUNCATE_LEN);
+      allMessages = [...messages, ...historyMessages];
+      estimatedTotal = estimateTokens(allMessages.map(m => m.content).join(""));
     }
+
+    // Replace messages array with final trimmed set
+    messages.push(...historyMessages);
+
+    // Send context pressure indicator to webview
+    const pressureLevel = estimatedTotal > MAX_PROMPT_TOKENS * 0.8 ? "high"
+      : estimatedTotal > MAX_PROMPT_TOKENS * 0.5 ? "medium" : "low";
+    panel?.webview.postMessage({
+      type: "contextPressure",
+      level: pressureLevel,
+      estimatedTokens: estimatedTotal,
+    });
 
     // Signal streaming start
     panel?.webview.postMessage({
@@ -169,8 +231,9 @@ async function handleChat(userText: string, systemPrompt?: string) {
     activeCancellation = new vscode.CancellationTokenSource();
 
     let fullResponse = "";
+    let finishReason = "stop";
     try {
-      fullResponse = await completeStream(
+      const result = await completeStream(
         {
           messages,
           maxTokens: harnessEnabled ? harnessMaxTokens : undefined,
@@ -180,6 +243,8 @@ async function handleChat(userText: string, systemPrompt?: string) {
         },
         activeCancellation.token
       );
+      fullResponse = result.text;
+      finishReason = result.finishReason;
     } catch (err: any) {
       if (err.message === "Cancelled") {
         panel?.webview.postMessage({ type: "streamEnd", cancelled: true });
@@ -195,6 +260,61 @@ async function handleChat(userText: string, systemPrompt?: string) {
     } finally {
       activeCancellation?.dispose();
       activeCancellation = undefined;
+    }
+
+    // Auto-continue if there's a partial (unclosed) tool_call.
+    // LM Studio may return "stop" even when truncated (reasoning models),
+    // so we trigger on hasPartialToolCall regardless of finish_reason.
+    const MAX_CONTINUATIONS = 2;
+    let continuationCount = 0;
+    while (
+      continuationCount < MAX_CONTINUATIONS &&
+      !abortLoop &&
+      hasPartialToolCall(fullResponse)
+    ) {
+      continuationCount++;
+      panel?.webview.postMessage({
+        type: "streamToken",
+        token: "\n\n... [auto-continuing truncated response] ...\n\n",
+      });
+
+      const contMessages: ChatMessage[] = [...messages];
+      contMessages.push({ role: "assistant", content: fullResponse });
+      contMessages.push({
+        role: "user",
+        content: "Continue exactly from where you stopped. Do not repeat prior text.",
+      });
+
+      activeCancellation = new vscode.CancellationTokenSource();
+      try {
+        const contResult = await completeStream(
+          { messages: contMessages, maxTokens: harnessMaxTokens },
+          (token) => {
+            panel?.webview.postMessage({ type: "streamToken", token });
+          },
+          activeCancellation.token
+        );
+        fullResponse += contResult.text;
+        finishReason = contResult.finishReason;
+        // Break if continuation was empty/near-empty
+        if (contResult.text.length < 10) break;
+        // Break if continuation didn't progress the tool call
+        // (model is generating summaries instead of continuing code)
+        const progressedToolCall = contResult.text.includes("</tool_call>")
+          || contResult.text.includes("</content>");
+        if (!progressedToolCall) break;
+      } catch (err: any) {
+        if (err.message !== "Cancelled") {
+          panel?.webview.postMessage({
+            type: "streamToken",
+            token: "\n[continuation failed, proceeding with partial response]\n",
+          });
+        }
+        break;
+      } finally {
+        activeCancellation?.dispose();
+        activeCancellation = undefined;
+      }
     }
 
     conversationHistory.push({ role: "assistant", content: fullResponse });
@@ -214,7 +334,7 @@ async function handleChat(userText: string, systemPrompt?: string) {
         conversationHistory.pop(); // remove the empty assistant message
         conversationHistory.push({
           role: "user",
-          content: "[System: Your previous response was empty. Please continue — analyze the tool results above and provide your answer or next steps.]",
+          content: "[System: Your previous response was empty. You MUST respond with text. Summarize what you did, report the results, and tell the user what to do next. Do NOT make tool calls — just provide your final report.]",
         });
         panel?.webview.postMessage({ type: "streamEnd" });
         continue; // retry this iteration
@@ -223,8 +343,41 @@ async function handleChat(userText: string, systemPrompt?: string) {
       return;
     }
 
-    const toolCalls = parseToolCalls(fullResponse);
+    let toolCalls = parseToolCalls(fullResponse);
+
+    // Salvage: if no tool calls were parsed but there's a partial write_file,
+    // close the tag artificially and re-parse
+    if (toolCalls.length === 0 && hasPartialToolCall(fullResponse)) {
+      const writeMatch = fullResponse.match(/<tool_call>\s*<name>write_file<\/name>\s*<path>([^<]+)<\/path>\s*<content>([\s\S]+)$/);
+      if (writeMatch) {
+        const partialPath = writeMatch[1].trim();
+        const partialContent = writeMatch[2].replace(/\n*$/, "");
+        fullResponse = fullResponse.replace(
+          /<tool_call>\s*<name>write_file<\/name>\s*<path>[^<]+<\/path>\s*<content>[\s\S]+$/,
+          `<tool_call><name>write_file</name><path>${partialPath}</path><content>${partialContent}</content></tool_call>`
+        );
+        // Update the assistant message in history with the fixed version
+        conversationHistory[conversationHistory.length - 1].content = fullResponse;
+        toolCalls = parseToolCalls(fullResponse);
+        if (toolCalls.length > 0) {
+          panel?.webview.postMessage({
+            type: "streamToken",
+            token: "\n[File was truncated — saving what was generated. The model can fix it in the next iteration.]\n",
+          });
+        }
+      }
+    }
     if (toolCalls.length === 0) {
+      // If the model dumped a large code block without using write_file, nudge it
+      const hasLargeCodeBlock = fullResponse.includes("```") && fullResponse.length > 500;
+      if (hasLargeCodeBlock && iteration === 0) {
+        conversationHistory.push({
+          role: "user",
+          content: "[System: You wrote code in the chat instead of using a tool. Use write_file to create the file, or replace_lines/edit_file to modify an existing file. Do NOT output code directly — use the tools.]",
+        });
+        panel?.webview.postMessage({ type: "streamEnd" });
+        continue;
+      }
       panel?.webview.postMessage({ type: "streamEnd" });
       return;
     }
@@ -270,7 +423,7 @@ async function handleChat(userText: string, systemPrompt?: string) {
         output: result.output.slice(0, 2000), // Truncate for webview display
       });
 
-      const label = call.type === "read_file" ? `read_file(${call.path})`
+      const label = call.type === "read_file" ? `read_file(${call.path}${call.startLine ? `:${call.startLine}-${call.endLine || 'end'}` : ''})`
         : call.type === "write_file" ? `write_file(${call.path})`
         : call.type === "edit_file" ? `edit_file(${call.path})`
         : call.type === "replace_lines" ? `replace_lines(${call.path}:${call.startLine}-${call.endLine})`
@@ -283,14 +436,77 @@ async function handleChat(userText: string, systemPrompt?: string) {
 
     if (abortLoop) break;
 
+    // Track read_file usage for verification loop detection
+    let hasWriteOrCommand = false;
+    for (const call of toolCalls) {
+      if (call.type === "read_file") {
+        readFileCounter[call.path] = (readFileCounter[call.path] || 0) + 1;
+      }
+      if (call.type === "write_file" || call.type === "edit_file" || call.type === "replace_lines" || call.type === "run_command") {
+        hasWriteOrCommand = true;
+      }
+    }
+    if (!hasWriteOrCommand && toolCalls.every(c => c.type === "read_file")) {
+      consecutiveReadOnlyIterations++;
+    } else {
+      consecutiveReadOnlyIterations = 0;
+    }
+
+    // Track consecutive all-fail iterations
+    const failedCount = toolResults.filter(r => r.includes("\nFailed:")).length;
+    const successCount = toolResults.length - failedCount;
+    const hasEditFailure = toolResults.some(r =>
+      (r.includes("replace_lines") || r.includes("edit_file")) && r.includes("\nFailed:")
+    );
+
+    if (successCount === 0 && failedCount > 0) {
+      consecutiveFailures++;
+    } else {
+      consecutiveFailures = 0;
+    }
+
+    // After 3 consecutive all-fail iterations, force the model to stop using tools
+    if (consecutiveFailures >= 3) {
+      conversationHistory.push({
+        role: "user",
+        content: toolResults.join("\n\n") + "\n\n[System: STOP. Tools have failed 3 times in a row. "
+          + "Do NOT make any more tool calls. Instead, explain to the user what you were trying to do, "
+          + "what went wrong, and suggest how they can fix it manually. Provide your final answer now.]",
+      });
+      continue;
+    }
+
     // Feed tool results back as a user message for the next iteration
     const remaining = maxIterations - iteration - 1;
     let resultsContent = toolResults.join("\n\n");
-    resultsContent += "\n\nBased on the tool results above, continue your work. ";
+
+    // Add failure context
+    if (failedCount > 0) {
+      resultsContent += `\n\n[${failedCount} of ${toolResults.length} tool call(s) failed this iteration.]`;
+    }
+    if (hasEditFailure) {
+      resultsContent += `\n[Hint: read the file first with read_file to see current line numbers and content before attempting edits.]`;
+    }
+    if (consecutiveFailures >= 2) {
+      resultsContent += `\n\n[System: Tools have failed ${consecutiveFailures} times in a row. STOP retrying the same approach. `
+        + `Try: 1) read_file first to see current line numbers, 2) use a completely different tool or strategy, `
+        + `or 3) explain what you're trying to do and provide your final answer.]`;
+    }
+
+    // Verification loop detection — stop model from re-reading files endlessly
+    const overReadFiles = Object.entries(readFileCounter).filter(([, count]) => count >= 3);
+    if (overReadFiles.length > 0) {
+      resultsContent += `\n\n[System: You've read ${overReadFiles.map(([f, c]) => `"${f}" ${c} times`).join(", ")}. STOP re-reading files you've already verified. Proceed with your answer or next action.]`;
+    }
+    if (consecutiveReadOnlyIterations >= 3) {
+      resultsContent += `\n\n[System: STOP. You've spent ${consecutiveReadOnlyIterations} iterations only reading files. Do NOT read any more files. Provide your final answer NOW.]`;
+    }
+
+    resultsContent += "\n\nRespond with what you did and what to do next, or make more tool calls. ";
     if (remaining <= 3) {
-      resultsContent += `[System: ${remaining} iteration(s) remaining. Wrap up your work — provide your final answer without further tool calls if possible.]`;
+      resultsContent += `[${remaining} iteration(s) left — wrap up now, summarize what you did.]`;
     } else {
-      resultsContent += `[System: ${remaining} iteration(s) remaining. Analyze the results and proceed — explain what you found, make additional tool calls if needed, or provide your final answer.]`;
+      resultsContent += `[${remaining} iteration(s) left.]`;
     }
     conversationHistory.push({
       role: "user",
@@ -400,6 +616,12 @@ function getPlaygroundHTML(): string {
   /* Iteration badge */
   .iteration-badge { font-size: 10px; padding: 2px 8px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 10px; align-self: center; color: var(--accent); }
 
+  /* Context pressure indicator */
+  #context-pressure { font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-left: 4px; display: none; }
+  #context-pressure.low { display: none; }
+  #context-pressure.medium { display: inline; color: var(--warning); border: 1px solid var(--warning); }
+  #context-pressure.high { display: inline; color: var(--danger); border: 1px solid var(--danger); }
+
   /* Input area */
   #input-area { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); flex-shrink: 0; align-items: flex-end; }
   #user-input { flex: 1; padding: 8px 12px; background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--border); border-radius: 6px; font-family: inherit; font-size: 13px; resize: none; min-height: 38px; max-height: 150px; }
@@ -415,6 +637,7 @@ function getPlaygroundHTML(): string {
     <span class="model-name" id="model-name">—</span>
     <span class="endpoint" id="endpoint-label"></span>
     <span class="harness-badge" id="harness-badge" style="display:none">HARNESS</span>
+    <span id="context-pressure"></span>
     <span class="version" id="version-label">v—</span>
     <label id="auto-approve-toggle" title="Auto-approve all tool calls (no confirmation popups)" style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;margin-left:4px;">
       <input type="checkbox" id="auto-approve-cb" style="cursor:pointer;">
@@ -712,6 +935,15 @@ function getPlaygroundHTML(): string {
       case "toolCallResult":
         updateToolCard(msg.id, msg.success, msg.output);
         break;
+      case "contextPressure": {
+        const cpEl = document.getElementById("context-pressure");
+        if (cpEl) {
+          cpEl.className = msg.level === "high" ? "high" : msg.level === "medium" ? "medium" : "low";
+          cpEl.textContent = msg.level === "high" ? "CTX HIGH" : msg.level === "medium" ? "CTX ~" + msg.estimatedTokens + "t" : "";
+          cpEl.title = "Estimated prompt tokens: " + msg.estimatedTokens;
+        }
+        break;
+      }
       case "cleared":
         break;
     }

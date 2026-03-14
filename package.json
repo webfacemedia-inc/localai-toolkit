@@ -2,7 +2,7 @@
   "name": "localai-toolkit",
   "displayName": "LocalAI Toolkit",
   "description": "Local LM Studio-powered dev tools — commit messages, code explain, refactor, translate, agentic harness with tool use, and more.",
-  "version": "0.5.5",
+  "version": "0.7.4",
   "publisher": "webfacemedia",
   "author": "Tommy @ Webface Media",
   "license": "MIT",
@@ -232,8 +232,8 @@
         },
         "localai.harness.maxTokens": {
           "type": "number",
-          "default": 4096,
-          "description": "Max tokens for harness responses (higher than normal for agentic use)"
+          "default": 32768,
+          "description": "Max tokens for harness responses (higher = larger single-file generation, uses more VRAM)"
         },
         "localai.harness.maxIterations": {
           "type": "number",
